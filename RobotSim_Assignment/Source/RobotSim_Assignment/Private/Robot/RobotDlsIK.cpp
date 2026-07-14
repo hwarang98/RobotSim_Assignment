@@ -111,6 +111,83 @@ namespace
 		}
 		return true;
 	}
+
+	/**
+	 * DLS nullspace projection step을 계산한다: dq_null = N·v.
+	 *   J# = Jwᵀ A⁻¹,  N = I − J# Jw  (A = Jw Jwᵀ + λ² I는 호출부에서 이미 계산한 것을 재사용)
+	 *
+	 * A⁻¹은 명시적으로 만들지 않고 basis vector e_k마다 A z_k = e_k를 SolveLinearSystem6로
+	 * 풀어 z_k를 A⁻¹의 k번째 열로 채운다(A 대칭이므로 z_k가 그대로 열/행 모두 유효).
+	 * 하나라도 특이하면 dq_null을 0으로 두고 false를 반환해 nullspace 항을 이번 반복에서 건너뛴다.
+	 *
+	 * @param Jw        row-weighted Jacobian (task와 동일 스케일).
+	 * @param A         Jw Jwᵀ + λ² I (이미 계산됨).
+	 * @param V         desired nullspace 관절 속도(projection 전).
+	 * @param OutDqNull 결과 nullspace step(관절공간).
+	 * @return 성공 시 true, 특이 행렬로 skip 시 false(OutDqNull=0).
+	 */
+	bool ProjectNullspaceStep(
+		const double Jw[IKDim][IKDim],
+		const double A[IKDim][IKDim],
+		const double V[IKDim],
+		double OutDqNull[IKDim])
+	{
+		// A⁻¹ 구성: A z_k = e_k → z_k = A⁻¹의 k번째 열.
+		double Ainv[IKDim][IKDim];
+		for (int32 k = 0; k < IKDim; ++k)
+		{
+			double Basis[IKDim] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+			Basis[k] = 1.0;
+
+			double Z[IKDim];
+			if (!SolveLinearSystem6(A, Basis, Z))
+			{
+				for (int32 j = 0; j < IKDim; ++j)
+				{
+					OutDqNull[j] = 0.0;
+				}
+				return false;
+			}
+			for (int32 r = 0; r < IKDim; ++r)
+			{
+				Ainv[r][k] = Z[r];
+			}
+		}
+
+		// J# = Jwᵀ A⁻¹  →  Jsharp[j][i] = Σ_m Jw[m][j] · Ainv[m][i]
+		double Jsharp[IKDim][IKDim];
+		for (int32 j = 0; j < IKDim; ++j)
+		{
+			for (int32 i = 0; i < IKDim; ++i)
+			{
+				double Acc = 0.0;
+				for (int32 m = 0; m < IKDim; ++m)
+				{
+					Acc += Jw[m][j] * Ainv[m][i];
+				}
+				Jsharp[j][i] = Acc;
+			}
+		}
+
+		// N = I − J# Jw,  dq_null = N v.
+		//   OutDqNull[a] = Σ_b (δ_ab − Σ_i Jsharp[a][i]·Jw[i][b]) · V[b]
+		for (int32 a = 0; a < IKDim; ++a)
+		{
+			double Acc = 0.0;
+			for (int32 b = 0; b < IKDim; ++b)
+			{
+				double JsJw = 0.0;
+				for (int32 i = 0; i < IKDim; ++i)
+				{
+					JsJw += Jsharp[a][i] * Jw[i][b];
+				}
+				const double Nab = ((a == b) ? 1.0 : 0.0) - JsJw;
+				Acc += Nab * V[b];
+			}
+			OutDqNull[a] = Acc;
+		}
+		return true;
+	}
 } // namespace
 #pragma endregion
 
@@ -143,6 +220,7 @@ FRobotDlsIKResult FRobotDlsIK::SolveDlsIK(
 		Result.FinalError = FRobotPoseError::ComputePoseError(FinalTransform, TargetTransform);
 		Result.FinalPositionErrorCm = Result.FinalError.PositionErrorNorm();
 		Result.FinalRotationErrorRad = Result.FinalError.RotationErrorNorm();
+		Result.MaxAbsNormalizedJointDistance = ComputeMaxAbsNormalizedJointDistance(Model, State);
 	};
 
 	int32 Iteration = 0;
@@ -158,8 +236,9 @@ FRobotDlsIKResult FRobotDlsIK::SolveDlsIK(
 		{
 			FinalizeResult(/*bConverged*/ true, Iteration);
 			UE_LOG(LogRobotSim, Verbose,
-				TEXT("[FRobotDlsIK] 수렴: %d회 반복, 위치오차 %.4fcm, 회전오차 %.4frad"),
-				Result.Iterations, Result.FinalPositionErrorCm, Result.FinalRotationErrorRad);
+				TEXT("[FRobotDlsIK] 수렴: %d회 반복, 위치오차 %.4fcm, 회전오차 %.4frad, nullspace=%s, max관절편차 %.3f"),
+				Result.Iterations, Result.FinalPositionErrorCm, Result.FinalRotationErrorRad,
+				Result.bNullspaceUsed ? TEXT("사용") : TEXT("미사용"), Result.MaxAbsNormalizedJointDistance);
 			return Result;
 		}
 
@@ -223,6 +302,28 @@ FRobotDlsIKResult FRobotDlsIK::SolveDlsIK(
 			dq[j] = Acc;
 		}
 
+		// 5.5) (옵션) nullspace joint-limit avoidance.
+		// primary task를 방해하지 않는 nullspace 방향으로만 관절을 중립 쪽으로 되돌린다.
+		// dq = dq_task + N·dq_null_desired. weighting은 task와 동일한 Jw/A로 계산해 일관성을 유지한다.
+		if (Options.bUseNullspaceJointLimitAvoidance)
+		{
+			double NullVel[IKDim];
+			ComputeJointLimitAvoidanceVelocity(Model, State, Options, NullVel);
+
+			double DqNull[IKDim];
+			if (ProjectNullspaceStep(Jw, A, NullVel, DqNull))
+			{
+				double NullNormSq = 0.0;
+				for (int32 j = 0; j < IKDim; ++j)
+				{
+					dq[j] += DqNull[j];
+					NullNormSq += DqNull[j] * DqNull[j];
+				}
+				Result.bNullspaceUsed = true;
+				Result.NullspaceStepNorm = FMath::Sqrt(NullNormSq);
+			}
+		}
+
 		// 6) dq NaN/Inf 검사 후 MaxStepRad로 clamp.
 		bool bStepFinite = true;
 		for (int32 j = 0; j < IKDim; ++j)
@@ -258,8 +359,65 @@ FRobotDlsIKResult FRobotDlsIK::SolveDlsIK(
 	// 반복 소진: 미수렴이지만 오차는 줄어든 상태일 수 있다.
 	FinalizeResult(/*bConverged*/ false, Iteration);
 	UE_LOG(LogRobotSim, Verbose,
-		TEXT("[FRobotDlsIK] 미수렴: 최대 반복(%d) 소진. 위치오차 %.4fcm, 회전오차 %.4frad (도달 불가/local minimum 가능)"),
-		Result.Iterations, Result.FinalPositionErrorCm, Result.FinalRotationErrorRad);
+		TEXT("[FRobotDlsIK] 미수렴: 최대 반복(%d) 소진. 위치오차 %.4fcm, 회전오차 %.4frad, nullspace=%s, max관절편차 %.3f (도달 불가/local minimum 가능)"),
+		Result.Iterations, Result.FinalPositionErrorCm, Result.FinalRotationErrorRad,
+		Result.bNullspaceUsed ? TEXT("사용") : TEXT("미사용"), Result.MaxAbsNormalizedJointDistance);
 	return Result;
+}
+#pragma endregion
+
+#pragma region NullspaceHelpers
+void FRobotDlsIK::ComputeJointLimitAvoidanceVelocity(
+	const FSerial6DoFModel& Model,
+	const FRobot6DJointState& State,
+	const FRobotDlsIKOptions& Options,
+	double OutVelocity[6])
+{
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		const FRobotJointLimit& Limit = Model.JointLimits[i];
+		const double HalfRange = 0.5 * (Limit.MaxRad - Limit.MinRad);
+
+		// 가동 범위가 0이면 normalized가 정의되지 않으므로 회피하지 않는다.
+		if (!(HalfRange > SMALL_NUMBER))
+		{
+			OutVelocity[i] = 0.0;
+			continue;
+		}
+
+		const double Midpoint = 0.5 * (Limit.MinRad + Limit.MaxRad);
+		const double Normalized = (State.Q[i] - Midpoint) / HalfRange; // 0=중립, ±1=한계.
+
+		// activation ratio 미만(중앙부)이면 task를 방해하지 않도록 0.
+		if (FMath::Abs(Normalized) < Options.JointLimitActivationRatio)
+		{
+			OutVelocity[i] = 0.0;
+		}
+		else
+		{
+			// 한계 근처: 중립 방향(-normalized)으로 normalized 크기에 비례한 속도.
+			OutVelocity[i] = -Options.NullspaceGain * Normalized;
+		}
+	}
+}
+
+double FRobotDlsIK::ComputeMaxAbsNormalizedJointDistance(
+	const FSerial6DoFModel& Model,
+	const FRobot6DJointState& State)
+{
+	double MaxAbs = 0.0;
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		const FRobotJointLimit& Limit = Model.JointLimits[i];
+		const double HalfRange = 0.5 * (Limit.MaxRad - Limit.MinRad);
+		if (!(HalfRange > SMALL_NUMBER))
+		{
+			continue;
+		}
+		const double Midpoint = 0.5 * (Limit.MinRad + Limit.MaxRad);
+		const double Normalized = (State.Q[i] - Midpoint) / HalfRange;
+		MaxAbs = FMath::Max(MaxAbs, FMath::Abs(Normalized));
+	}
+	return MaxAbs;
 }
 #pragma endregion

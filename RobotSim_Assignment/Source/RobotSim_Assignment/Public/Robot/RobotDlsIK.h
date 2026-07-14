@@ -42,6 +42,28 @@ struct FRobotDlsIKOptions
 
 	/** true면 매 반복마다 결과를 관절 가동 범위로 clamp한다. */
 	bool bClampJointLimits = true;
+
+	//~ Nullspace joint-limit avoidance (STEP A-05) ---------------------------------
+
+	/**
+	 * true면 primary task(EE pose 추종)의 nullspace로 관절을 중립 자세 쪽으로 되돌리는
+	 * 보조 항을 추가한다. task-space에는 영향을 주지 않으므로 pose 수렴을 해치지 않는다.
+	 * 기본값 false: 켜지 않으면 STEP A-04와 완전히 동일하게 동작한다.
+	 */
+	bool bUseNullspaceJointLimitAvoidance = false;
+
+	/**
+	 * nullspace로 중립 자세를 향해 되돌리려는 보조 관절 속도의 크기(gain).
+	 * 너무 크면 매 반복 nullspace step이 커져 task 수렴을 방해할 수 있으므로 작게 둔다.
+	 */
+	double NullspaceGain = 0.05;
+
+	/**
+	 * 관절 한계 회피를 시작하는 normalized 거리 임계값 (0=중립, 1=한계).
+	 * |normalized| < 이 값이면 회피 속도를 0으로 두어, 중앙부에서는 task를 방해하지 않고
+	 * 한계 근처에서만 되돌림을 활성화한다.
+	 */
+	double JointLimitActivationRatio = 0.65;
 };
 
 /**
@@ -69,6 +91,17 @@ struct FRobotDlsIKResult
 
 	/** 최종 회전 오차 크기 (radian). */
 	double FinalRotationErrorRad = 0.0;
+
+	//~ Nullspace joint-limit avoidance 진단값 (STEP A-05) --------------------------
+
+	/** 이번 solve에서 nullspace joint-limit avoidance 항을 실제로 적용했으면 true. */
+	bool bNullspaceUsed = false;
+
+	/** 최종 상태의 max |normalized joint distance| (0=모두 중립, 1=한계에 붙음). */
+	double MaxAbsNormalizedJointDistance = 0.0;
+
+	/** 마지막 반복에서 적용된 nullspace step(N·dq_null)의 크기(norm). 미사용 시 0. */
+	double NullspaceStepNorm = 0.0;
 };
 
 /**
@@ -108,4 +141,29 @@ struct FRobotDlsIK
 		const FRobot6DJointState& InitialState,
 		const FTransform& TargetTransform,
 		const FRobotDlsIKOptions& Options);
+
+	/**
+	 * @brief 각 관절을 중립(midpoint) 쪽으로 되돌리려는 desired nullspace 관절 속도를 계산한다.
+	 *
+	 * projection(N) 적용 전의 "원하는 속도"이며, task-space 제약은 아직 반영하지 않았다.
+	 * 관절 i에 대해:
+	 *   midpoint = (min+max)/2, halfRange = (max-min)/2, normalized = (q-midpoint)/halfRange
+	 *   |normalized| < JointLimitActivationRatio → 0
+	 *   그 이상 → -NullspaceGain · normalized  (중립 방향, 크기에 비례)
+	 *
+	 * @param OutVelocity 관절공간 속도 6개 (radian 스케일, weighting 없음).
+	 */
+	static void ComputeJointLimitAvoidanceVelocity(
+		const FSerial6DoFModel& Model,
+		const FRobot6DJointState& State,
+		const FRobotDlsIKOptions& Options,
+		double OutVelocity[6]);
+
+	/**
+	 * @brief 상태의 max |normalized joint distance|를 반환한다 (0=모두 중립, 1=한계에 붙음).
+	 *        로그/테스트에서 "관절이 한계에 얼마나 가까운가"를 한 값으로 보기 위한 진단 함수.
+	 */
+	static double ComputeMaxAbsNormalizedJointDistance(
+		const FSerial6DoFModel& Model,
+		const FRobot6DJointState& State);
 };

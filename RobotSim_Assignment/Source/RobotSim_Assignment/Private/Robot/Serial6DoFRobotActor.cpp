@@ -288,15 +288,18 @@ void ASerial6DoFRobotActor::SolveIKToTarget()
 {
 	// 현재 관절 상태를 초기값으로, TargetEndEffectorWorld를 목표로 순수 수학 DLS IK를 푼다.
 	// 프레임 규약은 LogCurrentEndEffectorPoseErrorToTarget과 동일(모델 Transform vs Target 직접 비교).
-	const FRobotDlsIKOptions Options; // 기본 옵션 사용.
+	// 기본 옵션 + 디테일 패널의 nullspace 토글만 반영한다(과도한 UI 확장 없음).
+	FRobotDlsIKOptions Options;
+	Options.bUseNullspaceJointLimitAvoidance = bUseNullspaceJointLimitAvoidance;
 	const FRobotDlsIKResult IKResult =
 		FRobotDlsIK::SolveDlsIK(GetModel(), GetJointState(), TargetEndEffectorWorld, Options);
 
 	UE_LOG(LogRobotSim, Log,
-		TEXT("[ASerial6DoFRobotActor] IK %s: %d회 반복, 최종 위치오차 %.3fcm, 회전오차 %.4frad = %.2f도"),
+		TEXT("[ASerial6DoFRobotActor] IK %s: %d회 반복, 최종 위치오차 %.3fcm, 회전오차 %.4frad = %.2f도, nullspace=%s, max관절편차 %.3f"),
 		IKResult.bConverged ? TEXT("수렴") : TEXT("미수렴"),
 		IKResult.Iterations, IKResult.FinalPositionErrorCm,
-		IKResult.FinalRotationErrorRad, FMath::RadiansToDegrees(IKResult.FinalRotationErrorRad));
+		IKResult.FinalRotationErrorRad, FMath::RadiansToDegrees(IKResult.FinalRotationErrorRad),
+		IKResult.bNullspaceUsed ? TEXT("사용") : TEXT("미사용"), IKResult.MaxAbsNormalizedJointDistance);
 
 	// 결과 관절 해를 적용한다(SetJointAngles 내부에서 ClampToLimits + 비주얼 반영).
 	SetJointAngles(IKResult.Solution);

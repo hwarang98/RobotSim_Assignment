@@ -197,6 +197,14 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Robot|PoseError")
 	FTransform TargetEndEffectorWorld = FTransform::Identity;
 
+	/**
+	 * SolveIKToTarget에서 nullspace joint-limit avoidance 항을 켤지 여부 (디버그 토글).
+	 * 켜면 EE pose 추종을 방해하지 않는 nullspace로 관절을 중립 자세 쪽으로 되돌린다.
+	 * 기본값 false: STEP A-04와 동일하게 동작한다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Robot|IK")
+	bool bUseNullspaceJointLimitAvoidance = false;
+
 	/** 각 관절 프레임과 EE 프레임에 디버그 좌표축을 그릴지 여부 */
 	UPROPERTY(EditAnywhere, Category = "Robot|Debug")
 	bool bDrawDebugFrames = true;
