@@ -8,6 +8,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Robot/RobotDlsIK.h"
 #include "Robot/RobotJacobian.h"
 #include "Robot/RobotPoseError.h"
 #include "Robot/RobotSimLog.h"
@@ -284,6 +285,30 @@ void ASerial6DoFRobotActor::ResetJointAngles()
 	ApplyAnglesFromEditor();
 
 	UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] 모든 관절 각도를 0으로 초기화했습니다."));
+}
+
+void ASerial6DoFRobotActor::SolveIKToTarget()
+{
+	// 현재 관절 상태를 초기값으로, TargetEndEffectorWorld를 목표로 순수 수학 DLS IK를 푼다.
+	// 프레임 규약은 LogCurrentEndEffectorPoseErrorToTarget과 동일(모델 Transform vs Target 직접 비교).
+	const FRobotDlsIKOptions Options; // 기본 옵션 사용.
+	const FRobotDlsIKResult IKResult =
+		FRobotDlsIK::SolveDlsIK(GetModel(), GetJointState(), TargetEndEffectorWorld, Options);
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] IK %s: %d회 반복, 최종 위치오차 %.3fcm, 회전오차 %.4frad = %.2f도"),
+		IKResult.bConverged ? TEXT("수렴") : TEXT("미수렴"),
+		IKResult.Iterations, IKResult.FinalPositionErrorCm,
+		IKResult.FinalRotationErrorRad, FMath::RadiansToDegrees(IKResult.FinalRotationErrorRad));
+
+	// 결과 관절 해를 적용한다(SetJointAngles 내부에서 ClampToLimits + 비주얼 반영).
+	SetJointAngles(IKResult.Solution);
+
+	// 에디터 디테일 패널의 도 단위 표시를 실제 적용된 관절 값으로 동기화한다.
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		JointAnglesDeg[i] = FMath::RadiansToDegrees(CurrentState.Q[i]);
+	}
 }
 
 void ASerial6DoFRobotActor::ApplyAnglesFromEditor()

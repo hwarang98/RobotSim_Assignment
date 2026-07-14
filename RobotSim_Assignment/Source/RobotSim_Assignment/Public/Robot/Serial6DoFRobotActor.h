@@ -145,6 +145,13 @@ public:
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void ResetJointAngles();
 
+	/**
+	 * 현재 관절 상태를 초기값으로, TargetEndEffectorWorld를 목표로 DLS IK를 풀어 결과를 적용한다 (디버그 전용).
+	 * 순수 수학 FRobotDlsIK로 계산하며, 마우스 드래그/pick·place 등 UI는 만들지 않는다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void SolveIKToTarget();
+
 	#pragma endregion
 
 	#pragma region BoneProbe
