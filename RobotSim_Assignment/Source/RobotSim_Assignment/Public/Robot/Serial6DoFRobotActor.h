@@ -127,6 +127,13 @@ public:
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void LogEndEffectorPose();
 
+	/**
+	 * 현재 EE 자세와 TargetEndEffectorWorld 사이의 6D pose error를 로그로 출력한다 (디버그 전용).
+	 * 순수 수학 FRobotPoseError로 계산하며, IK 이동이나 UI는 수행하지 않는다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void LogCurrentEndEffectorPoseErrorToTarget();
+
 	/** 모든 관절 각도를 0으로 초기화한다. */
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void ResetJointAngles();
@@ -220,6 +227,13 @@ protected:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Robot|BoneProbe")
 	bool bShowProbeMesh = false;
+
+	/**
+	 * LogCurrentEndEffectorPoseErrorToTarget이 사용하는 월드 공간 목표 EE 자세 (디버그 전용).
+	 * pose error = 이 목표 − 현재 EE. IK 입력이 아니라 오차 계산 확인용 값이다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Robot|PoseError")
+	FTransform TargetEndEffectorWorld = FTransform::Identity;
 
 	/** 각 관절 프레임과 EE 프레임에 디버그 좌표축을 그릴지 여부 */
 	UPROPERTY(EditAnywhere, Category = "Robot|Debug")

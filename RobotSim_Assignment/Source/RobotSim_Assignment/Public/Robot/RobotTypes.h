@@ -78,3 +78,52 @@ struct FRobot6DJointState
 	/** 관절 각도 Q[0]~Q[5] (radian) */
 	double Q[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 };
+
+/**
+ * @struct FRobot6DPoseError
+ * @brief 현재 EE 자세와 목표 자세 사이의 6D pose error(위치 + 회전).
+ *
+ * 부호 규약: "current → target" 방향의 오차다 (target − current).
+ * 이후 IK 단계(A-03 Jacobian, A-04 DLS)에서 Δx 입력 6-벡터로 사용된다.
+ * 리플렉션이 필요 없는 순수 계산용 타입이므로 USTRUCT로 만들지 않는다.
+ *
+ * @details
+ * 단위 규약:
+ * - 위치 오차: Unreal cm
+ * - 회전 오차: radian. axis-angle(= quaternion log × 2) 형태의 rotation vector로,
+ *   벡터 방향 = 회전축, 벡터 크기 = 최단 회전각(rad). Euler 각 차이가 아니다.
+ */
+struct FRobot6DPoseError
+{
+	/** 위치 오차 (cm) = TargetPosition − CurrentPosition */
+	FVector PositionErrorCm = FVector::ZeroVector;
+
+	/** 회전 오차 (radian) = axis × angle rotation vector (shortest path) */
+	FVector RotationErrorRad = FVector::ZeroVector;
+
+	/**
+	 * 6-벡터 [px, py, pz, rx, ry, rz]로 채워 반환한다.
+	 * A-03 Jacobian / A-04 DLS의 오차 입력 벡터 레이아웃과 동일하다.
+	 */
+	void ToArray6(double Out[6]) const
+	{
+		Out[0] = PositionErrorCm.X;
+		Out[1] = PositionErrorCm.Y;
+		Out[2] = PositionErrorCm.Z;
+		Out[3] = RotationErrorRad.X;
+		Out[4] = RotationErrorRad.Y;
+		Out[5] = RotationErrorRad.Z;
+	}
+
+	/** 위치 오차 크기 (cm) */
+	double PositionErrorNorm() const
+	{
+		return PositionErrorCm.Size();
+	}
+
+	/** 회전 오차 크기 = 최단 회전각 (radian) */
+	double RotationErrorNorm() const
+	{
+		return RotationErrorRad.Size();
+	}
+};

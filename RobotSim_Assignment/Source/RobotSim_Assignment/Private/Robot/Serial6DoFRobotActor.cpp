@@ -8,6 +8,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Robot/RobotPoseError.h"
 #include "Robot/RobotSimLog.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -233,6 +234,23 @@ void ASerial6DoFRobotActor::LogEndEffectorPose()
 		EEPose.Orientation.X, EEPose.Orientation.Y, EEPose.Orientation.Z, EEPose.Orientation.W);
 
 	CheckVisualMatchesMath();
+}
+
+void ASerial6DoFRobotActor::LogCurrentEndEffectorPoseErrorToTarget()
+{
+	// 현재 EE 월드 자세를 수학 FK로 구해 Transform으로 재구성한다.
+	const FRobot6DPose CurrentPose = GetEndEffectorPose();
+	const FTransform CurrentTransform(CurrentPose.Orientation, CurrentPose.PositionCm);
+
+	// 순수 수학 레이어로 6D pose error 계산 (target − current, world 프레임).
+	const FRobot6DPoseError Error = FRobotPoseError::ComputePoseError(CurrentTransform, TargetEndEffectorWorld);
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] Pose Error → 위치=(%.2f, %.2f, %.2f)cm |크기 %.2fcm|, ")
+		TEXT("회전=(%.4f, %.4f, %.4f)rad |크기 %.4frad = %.2f도|"),
+		Error.PositionErrorCm.X, Error.PositionErrorCm.Y, Error.PositionErrorCm.Z, Error.PositionErrorNorm(),
+		Error.RotationErrorRad.X, Error.RotationErrorRad.Y, Error.RotationErrorRad.Z,
+		Error.RotationErrorNorm(), FMath::RadiansToDegrees(Error.RotationErrorNorm()));
 }
 
 void ASerial6DoFRobotActor::ResetJointAngles()
