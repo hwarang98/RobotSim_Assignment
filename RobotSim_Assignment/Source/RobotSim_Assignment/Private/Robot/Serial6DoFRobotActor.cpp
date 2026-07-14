@@ -8,6 +8,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Robot/RobotJacobian.h"
 #include "Robot/RobotPoseError.h"
 #include "Robot/RobotSimLog.h"
 #include "UObject/ConstructorHelpers.h"
@@ -251,6 +252,27 @@ void ASerial6DoFRobotActor::LogCurrentEndEffectorPoseErrorToTarget()
 		Error.PositionErrorCm.X, Error.PositionErrorCm.Y, Error.PositionErrorCm.Z, Error.PositionErrorNorm(),
 		Error.RotationErrorRad.X, Error.RotationErrorRad.Y, Error.RotationErrorRad.Z,
 		Error.RotationErrorNorm(), FMath::RadiansToDegrees(Error.RotationErrorNorm()));
+}
+
+void ASerial6DoFRobotActor::LogCurrentNumericalJacobian()
+{
+	// 현재 관절 자세 기준 6×6 numerical Jacobian을 순수 수학 레이어로 계산한다 (관절 변경 없음).
+	const FRobotJacobian6x6 J = FRobotJacobian::ComputeNumericalJacobian(GetModel(), GetJointState());
+
+	// 행 = pose error [px,py,pz,rx,ry,rz], 열 = 관절 J0~J5.
+	static const TCHAR* RowLabels[6] = { TEXT("px"), TEXT("py"), TEXT("pz"), TEXT("rx"), TEXT("ry"), TEXT("rz") };
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] Numerical Jacobian 6×6 (행=pose error px/py/pz[cm/rad] rx/ry/rz[rad/rad], 열=J0~J5)"));
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor]         J0          J1          J2          J3          J4          J5"));
+	for (int32 Row = 0; Row < 6; ++Row)
+	{
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor] %s  %10.4f  %10.4f  %10.4f  %10.4f  %10.4f  %10.4f"),
+			RowLabels[Row],
+			J.At(Row, 0), J.At(Row, 1), J.At(Row, 2), J.At(Row, 3), J.At(Row, 4), J.At(Row, 5));
+	}
 }
 
 void ASerial6DoFRobotActor::ResetJointAngles()

@@ -134,6 +134,13 @@ public:
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void LogCurrentEndEffectorPoseErrorToTarget();
 
+	/**
+	 * 현재 JointAnglesDeg 기준 numerical Jacobian 6×6을 LogRobotSim에 보기 좋게 출력한다 (디버그 전용).
+	 * 순수 수학 FRobotJacobian으로 계산하며, IK 이동이나 관절 변경은 수행하지 않는다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void LogCurrentNumericalJacobian();
+
 	/** 모든 관절 각도를 0으로 초기화한다. */
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void ResetJointAngles();
