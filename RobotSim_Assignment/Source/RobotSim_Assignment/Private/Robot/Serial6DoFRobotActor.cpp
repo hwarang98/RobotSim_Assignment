@@ -9,6 +9,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Robot/RobotDlsIK.h"
+#include "Robot/RobotConfig.h"
 #include "Robot/RobotJacobian.h"
 #include "Robot/RobotPoseError.h"
 #include "Robot/RobotSimLog.h"
@@ -109,27 +110,16 @@ ASerial6DoFRobotActor::ASerial6DoFRobotActor()
 	SkeletalVisualComponent->SetGenerateOverlapEvents(false);
 	SkeletalVisualComponent->SetVisibility(false); // 에셋/본 매핑이 유효해질 때 ApplySkeletalMeshVisual()이 켠다
 
-	// 이 프로젝트 KUKA SkeletalMesh의 본 매핑 기본값 (Bone Probe로 확정, Details에서 재정의 가능).
-	// 메시는 수학 6R과 1:1이 아니라 approximate overlay다 (Step A-1.5b 참조):
-	// - pitch 관절 → 파츠 사이 연결 링크 본, yaw/roll 관절 → 파츠 제자리 회전 본.
-	// - J3(전완 roll)는 메시에 대응 자유도가 없어 None으로 둔다. Bone_005는 상하 pitch만
-	//   담당하는 구조라 roll을 얹으면 외형이 깨지므로, 시각화에서 J3를 skip한다.
-	//   (수학 FK/디버그 링크에는 J3가 6-DOF로 그대로 존재한다.)
-	// - 상완 Bone_003(J1에 종속), 체인 밖 보조 본 Bone_008/009는 매핑 제외.
-	JointBoneNames[0] = TEXT("Bone_001"); // J0 베이스 yaw   (파츠 제자리 회전)
-	JointBoneNames[1] = TEXT("Bone_002"); // J1 어깨 pitch   (001→003 링크)
-	JointBoneNames[2] = TEXT("Bone_004"); // J2 팔꿈치 pitch (003→005 링크)
-	JointBoneNames[3] = NAME_None;        // J3 전완 roll    — visual-only unmapped (메시 미지원)
-	JointBoneNames[4] = TEXT("Bone_006"); // J4 손목 pitch   (005→007 링크)
-	JointBoneNames[5] = TEXT("Bone_007"); // J5 툴 roll      (툴 파츠 제자리)
+	// 본 매핑과 SkeletalMesh 에셋은 이제 URobotConfig가 소유한다 (기본값은 URobotConfig 생성자 참조).
 }
 
 void ASerial6DoFRobotActor::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
 
-	// 에디터 배치/디테일 편집 시 각도와 비주얼 레이어를 즉시 반영한다.
-	ApplyAnglesFromEditor();
+	// RobotConfig(있으면)로 모델을 재구성하고 오프셋을 재미러링한 뒤 각도를 반영한다.
+	// 이어서 비주얼 레이어를 갱신한다.
+	RefreshFromConfig();
 	ApplyLinkVisuals();
 	ApplySkeletalMeshVisual();
 }
@@ -139,6 +129,17 @@ void ASerial6DoFRobotActor::PostEditChangeProperty(FPropertyChangedEvent& Proper
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
+	const FName MemberName = PropertyChangedEvent.GetMemberPropertyName();
+
+	// RobotConfig 포인터를 바꾸면 모델(기구학)과 SkeletalMesh 시각화를 모두 재구성한다.
+	// (에셋 '내부' 값 편집은 액터의 PostEditChangeProperty로 오지 않으므로, 그 경우엔
+	//  액터를 다시 선택/이동해 OnConstruction을 트리거하면 반영된다.)
+	if (MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, RobotConfig))
+	{
+		RefreshFromConfig();
+		ApplySkeletalMeshVisual();
+	}
+
 	// 고정 배열 UPROPERTY는 변경된 원소 인덱스를 알려주지 않으므로 6개 전부 재적용한다.
 	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, JointAnglesDeg))
 	{
@@ -147,7 +148,6 @@ void ASerial6DoFRobotActor::PostEditChangeProperty(FPropertyChangedEvent& Proper
 
 	// 구조체 배열 내부 필드 편집 시 GetPropertyName()은 내부 필드명(Mesh 등)을 주므로
 	// 소유 멤버(MemberProperty) 이름으로 판별한다.
-	const FName MemberName = PropertyChangedEvent.GetMemberPropertyName();
 	if (MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, LinkVisuals)
 		|| MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, bShowStaticMeshes)
 		|| MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, bShowDebugLinks))
@@ -155,10 +155,7 @@ void ASerial6DoFRobotActor::PostEditChangeProperty(FPropertyChangedEvent& Proper
 		ApplyLinkVisuals();
 	}
 
-	if (MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, SkeletalMeshAsset)
-		|| MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, JointBoneNames)
-		|| MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, bShowSkeletalMesh)
-		|| MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, bShowProbeMesh))
+	if (MemberName == GET_MEMBER_NAME_CHECKED(ASerial6DoFRobotActor, bShowSkeletalMesh))
 	{
 		ApplySkeletalMeshVisual();
 	}
@@ -311,6 +308,48 @@ void ASerial6DoFRobotActor::SolveIKToTarget()
 	}
 }
 
+void ASerial6DoFRobotActor::RefreshFromConfig()
+{
+	// 기구학 파라미터의 해석 지점: RobotConfig가 있으면 그 값으로, 없으면 코드 기본값으로.
+	// 수학 레이어(FSerial6DoFModel)는 DataAsset을 알지 못하며, 여기서만 값을 주입받는다.
+	Model = RobotConfig ? RobotConfig->ToModel() : FSerial6DoFModel::CreateDefault();
+
+	// 모델이 바뀌었을 수 있으므로 관절 컴포넌트의 오프셋을 다시 미러링한 뒤 각도를 재적용한다.
+	MirrorModelToComponents();
+	ApplyAnglesFromEditor();
+}
+
+void ASerial6DoFRobotActor::MirrorModelToComponents()
+{
+	// 관절 프레임의 상대 위치 = 모델 LinkOffsets, EE 프레임 상대 변환 = 모델 ToolOffset.
+	// 회전은 ApplyJointState()가 관절 각도로 매 적용하므로 여기서는 위치/툴 변환만 다룬다.
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		if (JointComponents[i])
+		{
+			JointComponents[i]->SetRelativeLocation(Model.LinkOffsets[i]);
+		}
+	}
+	if (ToolTipComponent)
+	{
+		ToolTipComponent->SetRelativeTransform(Model.ToolOffset);
+	}
+}
+
+USkeletalMesh* ASerial6DoFRobotActor::GetConfiguredSkeletalMesh() const
+{
+	return RobotConfig ? RobotConfig->SkeletalMeshAsset : nullptr;
+}
+
+FName ASerial6DoFRobotActor::GetConfiguredBoneName(int32 JointIndex) const
+{
+	if (!RobotConfig || JointIndex < 0 || JointIndex >= FSerial6DoFModel::NumJoints)
+	{
+		return NAME_None;
+	}
+	return RobotConfig->JointBoneNames[JointIndex];
+}
+
 void ASerial6DoFRobotActor::ApplyAnglesFromEditor()
 {
 	// 도 단위는 이 함수의 입구에서만 radian으로 변환한다 (단위 규약의 경계).
@@ -429,47 +468,48 @@ void ASerial6DoFRobotActor::ApplySkeletalMeshVisual()
 		return;
 	}
 
+	// 메시/본 이름은 RobotConfig가 소유한다. 여기서 한 번 해석해 로컬로 쓴다.
+	USkeletalMesh* const MeshAsset = GetConfiguredSkeletalMesh();
+
 	// 에셋이 바뀌었거나 포즈 버퍼가 아직 할당되지 않은 경우에만 재init한다.
-	// (무조건 reinit하면 관련 없는 프로퍼티 편집 때마다 Probe 포즈가 초기화되지만,
-	//  버퍼가 비어 있으면 이후 Reset/Sync가 인덱싱에서 크래시하므로 반드시 할당해 둔다.)
-	const bool bAssetChanged = (SkeletalVisualComponent->GetSkinnedAsset() != SkeletalMeshAsset);
-	const bool bPoseBufferEmpty = (SkeletalMeshAsset != nullptr && SkeletalVisualComponent->BoneSpaceTransforms.Num() == 0);
+	// (버퍼가 비어 있으면 이후 Reset/Sync가 인덱싱에서 크래시하므로 반드시 할당해 둔다.)
+	const bool bAssetChanged = (SkeletalVisualComponent->GetSkinnedAsset() != MeshAsset);
+	const bool bPoseBufferEmpty = (MeshAsset != nullptr && SkeletalVisualComponent->BoneSpaceTransforms.Num() == 0);
 	if (bAssetChanged || bPoseBufferEmpty)
 	{
-		SkeletalVisualComponent->SetSkinnedAssetAndUpdate(SkeletalMeshAsset, /*bReinitPose=*/true);
+		SkeletalVisualComponent->SetSkinnedAssetAndUpdate(MeshAsset, /*bReinitPose=*/true);
 	}
 
 	// 메시 활성 여부는 에셋 할당만으로 결정한다. KUKA 메시는 수학 6R과 1:1이 아니므로
 	// 일부 관절(예: J3 forearm roll)이 None이어도 메시를 숨기지 않고 해당 관절만 skip한다.
-	// 매핑 상태 보고는 Probe 모드가 아닐 때만 (조사 단계에서는 미완성 매핑이 정상).
-	bSkeletalMeshActive = (SkeletalMeshAsset != nullptr);
-	if (SkeletalMeshAsset && !IsTemplate() && !bShowProbeMesh)
+	bSkeletalMeshActive = (MeshAsset != nullptr);
+	if (MeshAsset && !IsTemplate())
 	{
 		for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 		{
-			if (JointBoneNames[i].IsNone())
+			const FName BoneName = GetConfiguredBoneName(i);
+			if (BoneName.IsNone())
 			{
 				// 의도적 미매핑 (수학에는 있으나 메시 외형이 지원하지 않는 자유도).
 				UE_LOG(LogRobotSim, Log,
 					TEXT("[ASerial6DoFRobotActor] J%d: visual-only unmapped joint — SkeletalMesh 동기화에서 skip합니다 (수학 FK/디버그 링크에는 그대로 존재)."), i);
 			}
-			else if (SkeletalVisualComponent->GetBoneIndex(JointBoneNames[i]) == INDEX_NONE)
+			else if (SkeletalVisualComponent->GetBoneIndex(BoneName) == INDEX_NONE)
 			{
 				// 이름은 있으나 에셋에 없음 — 오타 가능성. 해당 관절만 skip하고 메시는 계속 표시한다.
 				UE_LOG(LogRobotSim, Warning,
 					TEXT("[ASerial6DoFRobotActor] J%d의 본 '%s'을(를) SkeletalMesh '%s'에서 찾지 못했습니다. 이 관절만 skip합니다 (이름 오타 확인)."),
-					i, *JointBoneNames[i].ToString(), *SkeletalMeshAsset->GetName());
+					i, *BoneName.ToString(), *MeshAsset->GetName());
 			}
 		}
 	}
 
-	// 에셋만 있으면 표시한다 (Probe 모드/일반 모드 공통). 개별 관절 매핑 실패는 표시에 영향 없음.
-	SkeletalVisualComponent->SetVisibility(bSkeletalMeshActive && (bShowSkeletalMesh || bShowProbeMesh));
+	// 에셋만 있으면 표시한다. 개별 관절 매핑 실패는 표시에 영향 없음.
+	SkeletalVisualComponent->SetVisibility(bSkeletalMeshActive && bShowSkeletalMesh);
 
-	if (bSkeletalMeshActive && !bShowProbeMesh)
+	if (bSkeletalMeshActive)
 	{
-		// Probe 잔재(미매핑 본 포함)를 지운 뒤 동기화한다. 동기화는 매핑된 본만 쓰므로
-		// 리셋 없이는 Probe로 꺾어 둔 다른 본이 그대로 남는다.
+		// 미매핑 본을 ref pose로 되돌린 뒤 매핑된 본만 동기화한다.
 		ResetPoseToRefPose();
 		SyncSkeletalPoseToMath();
 	}
@@ -485,10 +525,8 @@ void ASerial6DoFRobotActor::SyncSkeletalPoseToMath()
 	// 디버그 링크/CheckVisualMatchesMath()가 담당한다.
 	//
 	// 전제: 메시의 바인드 포즈가 수학 Q=0 자세와 같은 구성이고, 본 체인 순서가
-	// J0→J5 순서와 일치한다 (Bone Probe로 확인된 매핑).
-	//
-	// Probe 모드 중에는 자동 동기화를 멈춰 Probe 포즈가 덮어써지지 않게 한다.
-	if (bShowProbeMesh || !bSkeletalMeshActive || !SkeletalVisualComponent || !SkeletalVisualComponent->GetSkinnedAsset())
+	// J0→J5 순서와 일치한다 (확정된 본 매핑).
+	if (!bSkeletalMeshActive || !SkeletalVisualComponent || !SkeletalVisualComponent->GetSkinnedAsset())
 	{
 		return;
 	}
@@ -516,7 +554,7 @@ void ASerial6DoFRobotActor::SyncSkeletalPoseToMath()
 
 	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 	{
-		const int32 BoneIndex = RefSkeleton.FindBoneIndex(JointBoneNames[i]);
+		const int32 BoneIndex = RefSkeleton.FindBoneIndex(GetConfiguredBoneName(i));
 		if (BoneIndex == INDEX_NONE)
 		{
 			continue; // 유효성 검증/Warning은 ApplySkeletalMeshVisual()이 담당
@@ -539,96 +577,6 @@ void ASerial6DoFRobotActor::SyncSkeletalPoseToMath()
 	}
 
 	SkeletalVisualComponent->RefreshBoneTransforms();
-}
-
-void ASerial6DoFRobotActor::ApplyBoneProbe()
-{
-	if (!SkeletalVisualComponent || !SkeletalVisualComponent->GetSkinnedAsset())
-	{
-		UE_LOG(LogRobotSim, Warning, TEXT("[ASerial6DoFRobotActor] SkeletalMeshAsset이 할당되지 않아 Bone Probe를 실행할 수 없습니다."));
-		return;
-	}
-
-	if (ProbeBoneName.IsNone() || SkeletalVisualComponent->GetBoneIndex(ProbeBoneName) == INDEX_NONE)
-	{
-		UE_LOG(LogRobotSim, Warning,
-			TEXT("[ASerial6DoFRobotActor] Probe 본 '%s'을(를) 찾을 수 없습니다. DumpSkeletonBones로 본 이름을 확인하세요."),
-			*ProbeBoneName.ToString());
-		return;
-	}
-
-	// Probe 결과가 보이도록 Probe 모드를 자동으로 켠다 (FK 동기화 중지 + 매핑 미완성이어도 표시).
-	if (!bShowProbeMesh)
-	{
-		bShowProbeMesh = true;
-		ApplySkeletalMeshVisual();
-		UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] bShowProbeMesh를 자동으로 켰습니다 (Probe 모드)."));
-	}
-
-	// 이전 Probe 잔재가 누적되지 않도록 항상 ref pose에서 시작한다.
-	if (!ResetPoseToRefPose())
-	{
-		return;
-	}
-
-	// ref pose 로컬 변환을 부모 체인으로 누적해 대상 본의 컴포넌트 공간 변환을 만든다.
-	// (방금 전체를 ref pose로 되돌렸으므로 이 값이 곧 현재 포즈다.)
-	const FReferenceSkeleton& RefSkeleton = SkeletalVisualComponent->GetSkinnedAsset()->GetRefSkeleton();
-	const TArray<FTransform>& RefPose = RefSkeleton.GetRefBonePose();
-	const int32 BoneIndex = RefSkeleton.FindBoneIndex(ProbeBoneName);
-
-	FTransform BoneComponentSpace = RefPose[BoneIndex];
-	for (int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
-		ParentIndex != INDEX_NONE;
-		ParentIndex = RefSkeleton.GetParentIndex(ParentIndex))
-	{
-		BoneComponentSpace *= RefPose[ParentIndex];
-	}
-
-	// 본 로컬 축 기준 회전: CS 회전의 오른쪽에 델타를 합성하면 본 자신의 축으로 돈다.
-	const FQuat DeltaRotation(ProbeAxisToVector(ProbeAxis), FMath::DegreesToRadians(ProbeAngleDeg));
-	FTransform NewComponentSpace = BoneComponentSpace;
-	NewComponentSpace.SetRotation(BoneComponentSpace.GetRotation() * DeltaRotation);
-
-	SkeletalVisualComponent->SetBoneTransformByName(ProbeBoneName, NewComponentSpace, EBoneSpaces::ComponentSpace);
-	SkeletalVisualComponent->RefreshBoneTransforms();
-
-	UE_LOG(LogRobotSim, Log,
-		TEXT("[ASerial6DoFRobotActor] Bone Probe 적용: 본 '%s'을(를) 로컬 %s축 기준 %.1f도 회전. 움직인 파츠를 기록하세요."),
-		*ProbeBoneName.ToString(),
-		ProbeAxis == EProbeAxis::X ? TEXT("X") : ProbeAxis == EProbeAxis::Y ? TEXT("Y") : TEXT("Z"),
-		ProbeAngleDeg);
-}
-
-void ASerial6DoFRobotActor::ResetBoneProbe()
-{
-	if (ResetPoseToRefPose())
-	{
-		UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] SkeletalMesh 포즈를 ref pose로 되돌렸습니다."));
-	}
-}
-
-void ASerial6DoFRobotActor::DumpSkeletonBones()
-{
-	if (!SkeletalVisualComponent || !SkeletalVisualComponent->GetSkinnedAsset())
-	{
-		UE_LOG(LogRobotSim, Warning, TEXT("[ASerial6DoFRobotActor] SkeletalMeshAsset이 할당되지 않아 본 목록을 출력할 수 없습니다."));
-		return;
-	}
-
-	const FReferenceSkeleton& RefSkeleton = SkeletalVisualComponent->GetSkinnedAsset()->GetRefSkeleton();
-	const int32 NumBones = RefSkeleton.GetNum();
-
-	UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] ===== SkeletalMesh '%s' 본 목록 (%d개) ====="),
-		*SkeletalVisualComponent->GetSkinnedAsset()->GetName(), NumBones);
-
-	for (int32 i = 0; i < NumBones; ++i)
-	{
-		const int32 ParentIndex = RefSkeleton.GetParentIndex(i);
-		const FString ParentName = (ParentIndex != INDEX_NONE) ? RefSkeleton.GetBoneName(ParentIndex).ToString() : TEXT("(root)");
-		UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor]   [%d] %s (parent: %s)"),
-			i, *RefSkeleton.GetBoneName(i).ToString(), *ParentName);
-	}
 }
 
 bool ASerial6DoFRobotActor::ResetPoseToRefPose()
@@ -655,16 +603,6 @@ bool ASerial6DoFRobotActor::ResetPoseToRefPose()
 	}
 	SkeletalVisualComponent->RefreshBoneTransforms();
 	return true;
-}
-
-FVector ASerial6DoFRobotActor::ProbeAxisToVector(EProbeAxis Axis)
-{
-	switch (Axis)
-	{
-	case EProbeAxis::X: return FVector::XAxisVector;
-	case EProbeAxis::Y: return FVector::YAxisVector;
-	default:            return FVector::ZAxisVector;
-	}
 }
 
 UStaticMeshComponent* ASerial6DoFRobotActor::CreateLinkMesh(

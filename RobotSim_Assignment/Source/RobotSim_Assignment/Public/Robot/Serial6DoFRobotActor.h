@@ -9,18 +9,10 @@
 #include "Serial6DoFRobotActor.generated.h"
 
 class UPoseableMeshComponent;
+class URobotConfig;
 class USkeletalMesh;
 class UStaticMesh;
 class UStaticMeshComponent;
-
-/** Bone Probe에서 본을 회전시킬 로컬 축 */
-UENUM()
-enum class EProbeAxis : uint8
-{
-	X,
-	Y,
-	Z
-};
 
 /**
  * @struct FLinkVisualConfig
@@ -66,13 +58,14 @@ struct FLinkVisualConfig
  * 추가로 두 가지 순수 비주얼 레이어를 제공한다:
  * - 링크별 StaticMesh 슬롯(LinkVisuals, Base + Link1~6): 분리 메시/디버그용
  * - SkeletalMesh 시각화(SkeletalVisualComponent): 수학 FK의 관절 회전각을
- *   J0~J5 대응 본(JointBoneNames)에 델타 회전 리타겟으로 얹어 본 체인을 동기화한다.
+ *   J0~J5 대응 본(RobotConfig의 JointBoneNames)에 델타 회전 리타겟으로 얹어 본 체인을 동기화한다.
  * 어느 레이어도 FK 결과에 영향을 주지 않는다. 수학 모델이 source of truth이고
  * 본 트랜스폼은 그 결과를 따라가기만 한다.
  *
  * @details
- * 관절 축과 링크 오프셋의 유일한 정의처는 FSerial6DoFModel이며, 생성자에서
- * 모델 값을 그대로 컴포넌트 계층에 미러링한다 (이중 정의 금지).
+ * 기구학 정의(축/오프셋/한계/툴)와 SkeletalMesh 배선은 RobotConfig(URobotConfig DataAsset)가
+ * 소유한다. RobotConfig가 None이면 기구학은 FSerial6DoFModel::CreateDefault()로 폴백하고
+ * SkeletalMesh 시각화는 비활성된다. RefreshFromConfig()가 모델을 컴포넌트 계층에 미러링한다.
  * 따라서 컴포넌트의 월드 트랜스폼과 수학 FK 결과는 항상 일치해야 하고,
  * 그 일치 여부를 CheckVisualMatchesMath()로 매 적용 시 검증한다.
  *
@@ -154,28 +147,16 @@ public:
 
 	#pragma endregion
 
-	#pragma region BoneProbe
-
-	/**
-	 * ProbeBoneName 본 하나만 ProbeAxis(본 로컬 축) 기준으로 ProbeAngleDeg만큼 회전시킨다.
-	 * 실행 전 전체를 ref pose로 되돌리므로 이전 Probe 잔재가 누적되지 않는다.
-	 * 어떤 본이 어떤 파츠를 움직이는지 확인해 JointBoneNames 매핑을 확정하기 위한 조사 도구.
-	 */
-	UFUNCTION(CallInEditor, Category = "Robot|BoneProbe")
-	void ApplyBoneProbe();
-
-	/** SkeletalMesh 포즈를 ref pose로 되돌린다. */
-	UFUNCTION(CallInEditor, Category = "Robot|BoneProbe")
-	void ResetBoneProbe();
-
-	/** SkeletalMesh의 모든 본을 [인덱스] 이름 (parent: 부모이름) 형식으로 로그에 출력한다. */
-	UFUNCTION(CallInEditor, Category = "Robot|BoneProbe")
-	void DumpSkeletonBones();
-
-	#pragma endregion
-
 protected:
 	#pragma region EditorProperties
+
+	/**
+	 * 로봇 정의 DataAsset — 기구학(축/오프셋/한계/툴) + 시각화 배선(SkeletalMesh/본 이름)을 모두 담는다.
+	 * 지정하면 이 값으로 모델과 SkeletalMesh 시각화를 구성한다. 비어 있으면(None) 기구학은 코드 기본값
+	 * FSerial6DoFModel::CreateDefault()를 쓰고, SkeletalMesh 시각화는 비활성(디버그 링크만 표시)된다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Robot|Config")
+	TObjectPtr<URobotConfig> RobotConfig;
 
 	/**
 	 * J0~J5 관절 각도 (도 단위, 에디터 조작용).
@@ -203,44 +184,11 @@ protected:
 	bool bShowDebugLinks = true;
 
 	/**
-	 * 시각화에 사용할 로봇 SkeletalMesh 에셋.
-	 * 본 체인은 수학 FK 결과를 따라가기만 하는 순수 비주얼이며, AnimBP 없이
-	 * PoseableMesh로 본 트랜스폼을 직접 쓴다.
+	 * SkeletalMesh 시각화를 표시할지 여부 (RobotConfig에 메시가 지정됐을 때만 실제로 보인다).
+	 * SkeletalMesh 에셋/본 이름 자체는 RobotConfig가 소유한다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Robot|Visual")
-	TObjectPtr<USkeletalMesh> SkeletalMeshAsset;
-
-	/**
-	 * J0~J5 관절에 대응하는 SkeletalMesh 본 이름 매핑.
-	 * 비어 있거나 에셋에 없는 이름이 있으면 Warning을 남기고 SkeletalMesh를 숨긴 채
-	 * 디버그 링크만 표시한다.
-	 */
-	UPROPERTY(EditAnywhere, Category = "Robot|Visual")
-	FName JointBoneNames[6];
-
-	/** SkeletalMesh 시각화를 표시할지 여부 (본 매핑이 유효할 때만 실제로 보인다) */
 	UPROPERTY(EditAnywhere, Category = "Robot|Visual")
 	bool bShowSkeletalMesh = true;
-
-	/** Probe로 회전시킬 본 이름 (DumpSkeletonBones 출력에서 선택) */
-	UPROPERTY(EditAnywhere, Category = "Robot|BoneProbe")
-	FName ProbeBoneName;
-
-	/** Probe 회전 축 (본 로컬 기준) */
-	UPROPERTY(EditAnywhere, Category = "Robot|BoneProbe")
-	EProbeAxis ProbeAxis = EProbeAxis::Z;
-
-	/** Probe 회전 각도 (도) */
-	UPROPERTY(EditAnywhere, Category = "Robot|BoneProbe")
-	double ProbeAngleDeg = 45.0;
-
-	/**
-	 * Probe 모드: 본 매핑(JointBoneNames)이 미완성이어도 SkeletalMesh를 표시하고,
-	 * FK 자동 동기화를 멈춰 Probe 포즈가 덮어써지지 않게 한다.
-	 * 본 매핑 조사 단계에서만 켜고, 매핑 확정 후에는 끈다.
-	 */
-	UPROPERTY(EditAnywhere, Category = "Robot|BoneProbe")
-	bool bShowProbeMesh = false;
 
 	/**
 	 * LogCurrentEndEffectorPoseErrorToTarget이 사용하는 월드 공간 목표 EE 자세 (디버그 전용).
@@ -310,6 +258,21 @@ private:
 	/** 주기 로그 타이머 */
 	double TimeSinceLastPoseLog = 0.0;
 
+	/**
+	 * RobotConfig(있으면)로 Model을 재구성하고 컴포넌트 오프셋을 재미러링한 뒤 현재 각도를 재적용한다.
+	 * RobotConfig가 None이면 CreateDefault()를 사용한다. OnConstruction/Config 변경 시 호출.
+	 */
+	void RefreshFromConfig();
+
+	/** 현재 Model의 링크 오프셋/툴 오프셋을 관절 컴포넌트 체인에 반영한다 (FK 미러링). */
+	void MirrorModelToComponents();
+
+	/** RobotConfig에서 SkeletalMesh 에셋을 얻는다 (없으면 nullptr). */
+	USkeletalMesh* GetConfiguredSkeletalMesh() const;
+
+	/** RobotConfig에서 관절 i(0~5)의 본 이름을 얻는다 (없으면 NAME_None). */
+	FName GetConfiguredBoneName(int32 JointIndex) const;
+
 	/** JointAnglesDeg(도)를 radian으로 변환해 SetJointAngles를 호출하고, 클램프 결과를 도로 되돌려 쓴다. */
 	void ApplyAnglesFromEditor();
 
@@ -345,11 +308,8 @@ private:
 	 */
 	void SyncSkeletalPoseToMath();
 
-	/** SkeletalMesh의 모든 본을 ref pose로 되돌린다. 성공 여부를 반환한다 (Probe 공용 헬퍼). */
+	/** SkeletalMesh의 모든 본을 ref pose로 되돌린다. 성공 여부를 반환한다 (동기화 전 초기화용). */
 	bool ResetPoseToRefPose();
-
-	/** ProbeAxis enum을 본 로컬 단위 축 벡터로 변환한다. */
-	static FVector ProbeAxisToVector(EProbeAxis Axis);
 
 	/** SkeletalMesh가 표시/동기화 대상인지 (= 에셋 할당됨). ApplySkeletalMeshVisual에서 갱신.
 	 *  개별 관절의 매핑 성공 여부와 무관하다 (미매핑 관절은 sync에서 개별 skip). */
