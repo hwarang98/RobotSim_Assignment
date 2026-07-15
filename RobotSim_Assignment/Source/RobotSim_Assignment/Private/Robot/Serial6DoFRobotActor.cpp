@@ -8,6 +8,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Robot/EndEffectorTargetActor.h"
 #include "Robot/RobotDlsIK.h"
 #include "Robot/RobotConfig.h"
 #include "Robot/RobotJacobian.h"
@@ -119,6 +120,19 @@ void ASerial6DoFRobotActor::OnConstruction(const FTransform& Transform)
 
 	// RobotConfig(있으면)로 모델을 재구성하고 오프셋을 재미러링한 뒤 각도를 반영한다.
 	// 이어서 비주얼 레이어를 갱신한다.
+	RefreshFromConfig();
+	ApplyLinkVisuals();
+	ApplySkeletalMeshVisual();
+}
+
+void ASerial6DoFRobotActor::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// PIE/게임 시작 시 컴포넌트가 완전히 등록된 상태에서 비주얼을 다시 초기화한다.
+	// OnConstruction만으로는 PIE에서 PoseableMesh 포즈 버퍼(BoneSpaceTransforms)가 준비되지 않아
+	// SyncSkeletalPoseToMath가 매 틱 조기 return → SkeletalMesh가 bind pose에 정지하는 문제가 있다.
+	// 여기서 ApplySkeletalMeshVisual을 다시 호출해 포즈 버퍼를 확실히 할당한다(리타겟 수식은 불변).
 	RefreshFromConfig();
 	ApplyLinkVisuals();
 	ApplySkeletalMeshVisual();
@@ -286,13 +300,27 @@ void ASerial6DoFRobotActor::ResetJointAngles()
 
 void ASerial6DoFRobotActor::SolveIKToTarget()
 {
-	// 현재 관절 상태를 초기값으로, TargetEndEffectorWorld를 목표로 순수 수학 DLS IK를 푼다.
-	// 프레임 규약은 LogCurrentEndEffectorPoseErrorToTarget과 동일(모델 Transform vs Target 직접 비교).
+	// 현재 관절 상태를 초기값으로, target을 목표로 순수 수학 DLS IK를 푼다.
+	// solver는 로봇 모델 공간(액터 로컬, BaseTransform=Identity 기준) target을 받는다.
+	//  - EndEffectorTargetActor(있으면): GetActorTransform()은 월드이므로 로봇 액터 기준 상대 변환으로 내린다.
+	//  - 없으면: 기존 TargetEndEffectorWorld는 이미 모델 공간 값이므로 그대로 사용(기존 동작 100% 보존).
+	// 주의: TargetActor의 월드 트랜스폼을 그대로 넘기면 로봇이 이동/회전된 맵에서 target이 틀어진다.
+	FTransform TargetModel;
+	if (EndEffectorTargetActor)
+	{
+		const FTransform TargetWorld = EndEffectorTargetActor->GetActorTransform();
+		TargetModel = TargetWorld.GetRelativeTransform(GetActorTransform());
+	}
+	else
+	{
+		TargetModel = TargetEndEffectorWorld;
+	}
+
 	// 기본 옵션 + 디테일 패널의 nullspace 토글만 반영한다(과도한 UI 확장 없음).
 	FRobotDlsIKOptions Options;
 	Options.bUseNullspaceJointLimitAvoidance = bUseNullspaceJointLimitAvoidance;
 	const FRobotDlsIKResult IKResult =
-		FRobotDlsIK::SolveDlsIK(GetModel(), GetJointState(), TargetEndEffectorWorld, Options);
+		FRobotDlsIK::SolveDlsIK(GetModel(), GetJointState(), TargetModel, Options);
 
 	UE_LOG(LogRobotSim, Log,
 		TEXT("[ASerial6DoFRobotActor] IK %s: %d회 반복, 최종 위치오차 %.3fcm, 회전오차 %.4frad = %.2f도, nullspace=%s, max관절편차 %.3f"),
@@ -308,6 +336,107 @@ void ASerial6DoFRobotActor::SolveIKToTarget()
 	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 	{
 		JointAnglesDeg[i] = FMath::RadiansToDegrees(CurrentState.Q[i]);
+	}
+}
+
+void ASerial6DoFRobotActor::SpawnOrAlignTargetToCurrentEndEffector()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 현재 EE 월드 자세 (모델 FK × 액터 트랜스폼). Target Actor는 월드에 배치되므로 월드 값을 쓴다.
+	const FTransform CurrentEEWorld = Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
+
+	if (!EndEffectorTargetActor)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = this;
+		EndEffectorTargetActor =
+			World->SpawnActor<AEndEffectorTargetActor>(AEndEffectorTargetActor::StaticClass(), CurrentEEWorld, SpawnParams);
+
+		if (EndEffectorTargetActor)
+		{
+			UE_LOG(LogRobotSim, Log,
+				TEXT("[ASerial6DoFRobotActor] End Effector Target Actor를 현재 EE 위치에 생성했습니다."));
+		}
+		else
+		{
+			UE_LOG(LogRobotSim, Warning,
+				TEXT("[ASerial6DoFRobotActor] End Effector Target Actor 생성에 실패했습니다."));
+		}
+	}
+	else
+	{
+		EndEffectorTargetActor->SetActorTransform(CurrentEEWorld);
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor] 기존 Target Actor를 현재 EE 위치로 정렬했습니다."));
+	}
+}
+
+void ASerial6DoFRobotActor::CopyCurrentEndEffectorToTarget()
+{
+	if (EndEffectorTargetActor)
+	{
+		// Target Actor는 월드 공간이므로 현재 EE 월드 자세로 맞춘다.
+		const FTransform CurrentEEWorld = Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
+		EndEffectorTargetActor->SetActorTransform(CurrentEEWorld);
+		UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] Target Actor를 현재 EE로 리셋했습니다."));
+	}
+	else
+	{
+		// TargetEndEffectorWorld는 모델 공간(actor-relative) 규약이므로 액터 트랜스폼을 합성하지 않는다.
+		TargetEndEffectorWorld = Model.ComputeEndEffectorTransform(CurrentState);
+		UE_LOG(LogRobotSim, Log, TEXT("[ASerial6DoFRobotActor] TargetEndEffectorWorld를 현재 EE(모델 공간)로 리셋했습니다."));
+	}
+}
+
+void ASerial6DoFRobotActor::CalibrateToolOffsetFromTarget()
+{
+	if (!EndEffectorTargetActor)
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] Target Actor가 없습니다. SpawnOrAlign으로 생성한 뒤 target을 실제 그리퍼 끝으로 옮기고 다시 실행하세요."));
+		return;
+	}
+
+	// 사용자가 target을 실제 그리퍼 끝에 배치했다고 보고, 그 월드 자세를 로봇 모델 공간으로 내린다.
+	const FTransform TipWorld = EndEffectorTargetActor->GetActorTransform();
+	const FTransform TipModel = TipWorld.GetRelativeTransform(GetActorTransform());
+
+	// J5(마지막 관절) 프레임 (모델 공간, 현재 자세 기준).
+	const FTransform J5Model = Model.ComputeJointWorldTransform(FSerial6DoFModel::NumJoints - 1, CurrentState);
+
+	// FK 합성이 EE_model = ToolOffset * J5_model 이므로, ToolOffset = TipModel을 J5Model 기준 상대 변환으로 역산.
+	const FTransform NewToolOffset = TipModel.GetRelativeTransform(J5Model);
+
+	const FVector Loc = NewToolOffset.GetLocation();
+	const FRotator Rot = NewToolOffset.Rotator();
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] ToolOffset 캘리브레이션 결과: 위치=(%.3f, %.3f, %.3f)cm, 회전(Roll,Pitch,Yaw)=(%.3f, %.3f, %.3f)도 (현재 자세 기준)."),
+		Loc.X, Loc.Y, Loc.Z, Rot.Roll, Rot.Pitch, Rot.Yaw);
+
+	if (RobotConfig)
+	{
+		// 영구 저장: DataAsset에 기록하고 모델을 재구성한다 (사용자가 에셋을 저장해야 유지됨).
+		RobotConfig->Modify();
+		RobotConfig->ToolOffset = NewToolOffset;
+		RobotConfig->MarkPackageDirty();
+		RefreshFromConfig();
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor] RobotConfig '%s'의 ToolOffset을 갱신했습니다. 에셋을 저장하세요(Ctrl+S)."),
+			*RobotConfig->GetName());
+	}
+	else
+	{
+		// RobotConfig가 없으면 모델에 직접 적용한다 (일시적: OnConstruction/BeginPlay 재구성 시 CreateDefault로 되돌아감).
+		Model.ToolOffset = NewToolOffset;
+		MirrorModelToComponents();
+		ApplyJointState();
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] RobotConfig가 없어 ToolOffset을 모델에 일시 적용했습니다(재구성 시 초기화됨). 영구 반영하려면 RobotConfig 에셋을 만들어 위 값을 ToolOffset에 입력하세요."));
 	}
 }
 
@@ -422,6 +551,13 @@ void ASerial6DoFRobotActor::DrawDebugJointFrames() const
 	const FTransform MathEE = Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
 	DrawDebugCoordinateSystem(World, MathEE.GetLocation(), MathEE.Rotator(),
 		DebugAxisLength * 1.5f, false, -1.0f, 0, DebugAxisThickness * 1.5f);
+
+	// 현재 EE와 IK target 사이 링크 라인 (target이 지정됐을 때만). solve 전/후 오차를 눈으로 확인.
+	if (bDrawTargetLink && EndEffectorTargetActor)
+	{
+		DrawDebugLine(World, MathEE.GetLocation(), EndEffectorTargetActor->GetActorLocation(),
+			FColor(255, 140, 0), false, -1.0f, 0, DebugAxisThickness);
+	}
 }
 
 void ASerial6DoFRobotActor::ApplyLinkVisuals()
@@ -474,11 +610,14 @@ void ASerial6DoFRobotActor::ApplySkeletalMeshVisual()
 	// 메시/본 이름은 RobotConfig가 소유한다. 여기서 한 번 해석해 로컬로 쓴다.
 	USkeletalMesh* const MeshAsset = GetConfiguredSkeletalMesh();
 
-	// 에셋이 바뀌었거나 포즈 버퍼가 아직 할당되지 않은 경우에만 재init한다.
-	// (버퍼가 비어 있으면 이후 Reset/Sync가 인덱싱에서 크래시하므로 반드시 할당해 둔다.)
+	// 에셋이 바뀌었거나 포즈 버퍼가 본 개수와 맞지 않을 때 재init한다.
+	// (버퍼 크기가 틀리면 Reset/Sync가 조기 return하거나 인덱싱에서 크래시하므로 반드시 재할당한다.
+	//  PIE 시작 시 버퍼가 비었거나 다른 크기로 남아 있는 경우를 여기서 흡수한다.)
+	const int32 ExpectedBoneCount = MeshAsset ? MeshAsset->GetRefSkeleton().GetNum() : 0;
 	const bool bAssetChanged = (SkeletalVisualComponent->GetSkinnedAsset() != MeshAsset);
-	const bool bPoseBufferEmpty = (MeshAsset != nullptr && SkeletalVisualComponent->BoneSpaceTransforms.Num() == 0);
-	if (bAssetChanged || bPoseBufferEmpty)
+	const bool bPoseBufferInvalid =
+		(MeshAsset != nullptr && SkeletalVisualComponent->BoneSpaceTransforms.Num() != ExpectedBoneCount);
+	if (bAssetChanged || bPoseBufferInvalid)
 	{
 		SkeletalVisualComponent->SetSkinnedAssetAndUpdate(MeshAsset, /*bReinitPose=*/true);
 	}

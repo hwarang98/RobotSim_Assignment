@@ -8,6 +8,7 @@
 #include "Robot/Serial6DoFModel.h"
 #include "Serial6DoFRobotActor.generated.h"
 
+class AEndEffectorTargetActor;
 class UPoseableMeshComponent;
 class URobotConfig;
 class USkeletalMesh;
@@ -85,6 +86,7 @@ public:
 	ASerial6DoFRobotActor();
 
 	virtual void OnConstruction(const FTransform& Transform) override;
+	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
 
 	/** 에디터 뷰포트에서도 Tick을 돌려 디버그 축을 PIE 밖에서도 볼 수 있게 한다. */
@@ -111,6 +113,9 @@ public:
 
 	FORCEINLINE const FSerial6DoFModel& GetModel() const { return Model; }
 	FORCEINLINE const FRobot6DJointState& GetJointState() const { return CurrentState; }
+
+	/** 현재 IK target 액터 (없으면 nullptr). interaction 레이어(PlayerController)가 공유하는 단일 소스. */
+	FORCEINLINE AEndEffectorTargetActor* GetEndEffectorTargetActor() const { return EndEffectorTargetActor; }
 
 	#pragma endregion
 
@@ -144,6 +149,30 @@ public:
 	 */
 	UFUNCTION(CallInEditor, Category = "Robot")
 	void SolveIKToTarget();
+
+	/**
+	 * 현재 EE 위치에 End Effector Target Actor를 생성하거나(없으면) 기존 target을 그 위치로 정렬한다.
+	 * 생성된 target의 월드 트랜스폼 = 현재 EE 월드 자세이므로 곧바로 solve하면 오차 0이다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void SpawnOrAlignTargetToCurrentEndEffector();
+
+	/**
+	 * target을 현재 End Effector 자세로 리셋한다. Target Actor가 있으면 그 월드 트랜스폼을,
+	 * 없으면 TargetEndEffectorWorld(모델 공간)를 현재 EE로 맞춘다. 키보드 R / 컨트롤러 리셋이 호출한다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void CopyCurrentEndEffectorToTarget();
+
+	/**
+	 * Target Actor를 실제 그리퍼 끝(툴 팁)에 둔 상태로 실행하면, J5 프레임 기준 상대 변환을 계산해
+	 * ToolOffset을 보정한다. EE 기준점(수학 ToolTip)을 실제 메시 그리퍼 끝에 맞추는 캘리브레이션 유틸리티다.
+	 * RobotConfig가 있으면 그 에셋의 ToolOffset에 영구 기록(에셋 저장 필요), 없으면 모델에 일시 적용한다.
+	 * 기구학(LinkOffsets/JointAxes/JointLimits)과 수학 테스트는 건드리지 않는다 — ToolOffset만 바꾼다.
+	 * 주의: ToolOffset은 현재 자세 기준으로 계산되므로 홈 자세(모든 관절 0)에서 실행하길 권장한다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void CalibrateToolOffsetFromTarget();
 
 	#pragma endregion
 
@@ -204,6 +233,18 @@ protected:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Robot|IK")
 	bool bUseNullspaceJointLimitAvoidance = false;
+
+	/**
+	 * IK 목표로 사용할 End Effector Target Actor. 지정되면 SolveIKToTarget이 이 액터의 월드 트랜스폼을
+	 * 로봇 모델 공간으로 변환해 solver에 넘긴다. 비어 있으면 기존 TargetEndEffectorWorld를 사용한다.
+	 * SpawnOrAlignTargetToCurrentEndEffector로 생성/정렬할 수 있다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Robot|IK")
+	TObjectPtr<AEndEffectorTargetActor> EndEffectorTargetActor;
+
+	/** 현재 EE와 target 사이에 디버그 링크 라인을 그릴지 여부 (target이 지정됐을 때만). */
+	UPROPERTY(EditAnywhere, Category = "Robot|IK")
+	bool bDrawTargetLink = true;
 
 	/** 각 관절 프레임과 EE 프레임에 디버그 좌표축을 그릴지 여부 */
 	UPROPERTY(EditAnywhere, Category = "Robot|Debug")
