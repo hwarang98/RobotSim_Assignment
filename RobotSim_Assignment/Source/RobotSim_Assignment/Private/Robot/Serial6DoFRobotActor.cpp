@@ -31,6 +31,28 @@ namespace Serial6DoFRobotActorConstants
 	constexpr float DebugAxisThickness = 0.8f;
 }
 
+namespace
+{
+	/** ToolOffset 캘리브레이션 로그용: FTransform을 위치/회전 한 줄로 분해해 출력한다. */
+	void LogTransformLine(const TCHAR* Label, const FTransform& T)
+	{
+		const FVector Loc = T.GetLocation();
+		const FRotator Rot = T.Rotator();
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor]   %-16s 위치=(%9.3f, %9.3f, %9.3f)cm, 회전(Roll,Pitch,Yaw)=(%8.3f, %8.3f, %8.3f)도"),
+			Label, Loc.X, Loc.Y, Loc.Z, Rot.Roll, Rot.Pitch, Rot.Yaw);
+	}
+
+	/** 두 월드 변환 사이의 6D pose 오차를 순수 수학 레이어로 계산해 한 줄로 출력한다. */
+	void LogPoseErrorLine(const TCHAR* Label, const FTransform& Current, const FTransform& Target)
+	{
+		const FRobot6DPoseError Error = FRobotPoseError::ComputePoseError(Current, Target);
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor]   %-16s 위치오차 %.4fcm, 회전오차 %.4f도"),
+			Label, Error.PositionErrorNorm(), FMath::RadiansToDegrees(Error.RotationErrorNorm()));
+	}
+}
+
 ASerial6DoFRobotActor::ASerial6DoFRobotActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -393,6 +415,35 @@ void ASerial6DoFRobotActor::CopyCurrentEndEffectorToTarget()
 	}
 }
 
+void ASerial6DoFRobotActor::LogToolOffsetCalibrationState()
+{
+	if (!EndEffectorTargetActor)
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] Target Actor가 없습니다. SpawnOrAlign으로 생성한 뒤 target을 실제 그리퍼 끝으로 옮기고 다시 실행하세요."));
+		return;
+	}
+
+	// CalibrateToolOffsetFromTarget과 동일한 계산이지만, 아무것도 적용하지 않는 미리보기 전용이다.
+	const FTransform TargetWorld = EndEffectorTargetActor->GetActorTransform();
+	const FTransform TargetModel = TargetWorld.GetRelativeTransform(GetActorTransform());
+	const FTransform J5Model = Model.ComputeJointWorldTransform(FSerial6DoFModel::NumJoints - 1, CurrentState);
+	const FTransform ProposedToolOffset = TargetModel.GetRelativeTransform(J5Model);
+	const FTransform MathEEWorld = Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] === ToolOffset 캘리브레이션 상태 (적용하지 않음) ==="));
+	LogTransformLine(TEXT("현재 ToolOffset"), Model.ToolOffset);
+	LogTransformLine(TEXT("적용 시 ToolOffset"), ProposedToolOffset);
+	LogTransformLine(TEXT("J5Model"), J5Model);
+	LogTransformLine(TEXT("TargetModel"), TargetModel);
+	LogTransformLine(TEXT("MathEEWorld"), MathEEWorld);
+	LogTransformLine(TEXT("TargetWorld"), TargetWorld);
+	LogPoseErrorLine(TEXT("현재 EE↔Target"), MathEEWorld, TargetWorld);
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] 실제 반영하려면 CalibrateToolOffsetFromTarget을 실행하세요."));
+}
+
 void ASerial6DoFRobotActor::CalibrateToolOffsetFromTarget()
 {
 	if (!EndEffectorTargetActor)
@@ -412,11 +463,15 @@ void ASerial6DoFRobotActor::CalibrateToolOffsetFromTarget()
 	// FK 합성이 EE_model = ToolOffset * J5_model 이므로, ToolOffset = TipModel을 J5Model 기준 상대 변환으로 역산.
 	const FTransform NewToolOffset = TipModel.GetRelativeTransform(J5Model);
 
-	const FVector Loc = NewToolOffset.GetLocation();
-	const FRotator Rot = NewToolOffset.Rotator();
+	// 적용 전 값. RefreshFromConfig()가 Model을 통째로 재구성하므로 분기 이전에 캡처해야 한다.
+	const FTransform OldToolOffset = Model.ToolOffset;
+
 	UE_LOG(LogRobotSim, Log,
-		TEXT("[ASerial6DoFRobotActor] ToolOffset 캘리브레이션 결과: 위치=(%.3f, %.3f, %.3f)cm, 회전(Roll,Pitch,Yaw)=(%.3f, %.3f, %.3f)도 (현재 자세 기준)."),
-		Loc.X, Loc.Y, Loc.Z, Rot.Roll, Rot.Pitch, Rot.Yaw);
+		TEXT("[ASerial6DoFRobotActor] === ToolOffset 캘리브레이션 (현재 자세 기준) ==="));
+	LogTransformLine(TEXT("기존 ToolOffset"), OldToolOffset);
+	LogTransformLine(TEXT("새 ToolOffset"), NewToolOffset);
+	LogTransformLine(TEXT("J5Model"), J5Model);
+	LogTransformLine(TEXT("TargetModel"), TipModel);
 
 	if (RobotConfig)
 	{
@@ -438,6 +493,15 @@ void ASerial6DoFRobotActor::CalibrateToolOffsetFromTarget()
 		UE_LOG(LogRobotSim, Warning,
 			TEXT("[ASerial6DoFRobotActor] RobotConfig가 없어 ToolOffset을 모델에 일시 적용했습니다(재구성 시 초기화됨). 영구 반영하려면 RobotConfig 에셋을 만들어 위 값을 ToolOffset에 입력하세요."));
 	}
+
+	// 적용 후 검증: 수학 EE가 실제로 target(사용자가 지정한 그리퍼 끝)에 얹혔는지 확인한다.
+	// 주의: RefreshFromConfig()는 ApplyAnglesFromEditor()로 CurrentState를 JointAnglesDeg에서 clamp 포함
+	// 재계산한다. 캘리브레이션은 재계산 전 CurrentState로 역산했으므로, 두 값이 어긋나 있으면 오차가 0이
+	// 아니게 된다 — 이 로그의 목적이 그 드리프트를 드러내는 것이므로 값을 보정하지 않고 그대로 출력한다.
+	const FTransform MathEEWorld = Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
+	LogTransformLine(TEXT("적용후 MathEEWorld"), MathEEWorld);
+	LogTransformLine(TEXT("TargetWorld"), TipWorld);
+	LogPoseErrorLine(TEXT("적용후 EE↔Target"), MathEEWorld, TipWorld);
 }
 
 void ASerial6DoFRobotActor::RefreshFromConfig()

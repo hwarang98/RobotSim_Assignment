@@ -165,10 +165,19 @@ public:
 	void CopyCurrentEndEffectorToTarget();
 
 	/**
+	 * 현재 J5 프레임 / ToolOffset / 수학 EE / Target Actor 사이의 차이를 로그로만 출력한다 (적용 없음).
+	 * CalibrateToolOffsetFromTarget 실행 전 현재 어긋남과 적용될 ToolOffset을 미리 확인하는 용도다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot")
+	void LogToolOffsetCalibrationState();
+
+	/**
 	 * Target Actor를 실제 그리퍼 끝(툴 팁)에 둔 상태로 실행하면, J5 프레임 기준 상대 변환을 계산해
 	 * ToolOffset을 보정한다. EE 기준점(수학 ToolTip)을 실제 메시 그리퍼 끝에 맞추는 캘리브레이션 유틸리티다.
 	 * RobotConfig가 있으면 그 에셋의 ToolOffset에 영구 기록(에셋 저장 필요), 없으면 모델에 일시 적용한다.
 	 * 기구학(LinkOffsets/JointAxes/JointLimits)과 수학 테스트는 건드리지 않는다 — ToolOffset만 바꾼다.
+	 * 적용 전(기존/새 ToolOffset, J5Model, TargetModel)과 적용 후(MathEEWorld, TargetWorld, 위치/회전 오차)를
+	 * LogRobotSim으로 출력하므로, 캘리브레이션이 실제로 맞았는지 로그만으로 검증할 수 있다.
 	 * 주의: ToolOffset은 현재 자세 기준으로 계산되므로 홈 자세(모든 관절 0)에서 실행하길 권장한다.
 	 */
 	UFUNCTION(CallInEditor, Category = "Robot")
