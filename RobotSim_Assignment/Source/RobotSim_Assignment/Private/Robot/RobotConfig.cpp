@@ -10,6 +10,7 @@ URobotConfig::URobotConfig()
 
 	BaseTransform = Default.BaseTransform;
 	ToolOffset = Default.ToolOffset;
+	GravityMPerSec2 = Default.GravityMPerSec2;
 
 	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 	{
@@ -18,6 +19,16 @@ URobotConfig::URobotConfig()
 		Joints[i].MinDeg = FMath::RadiansToDegrees(Default.JointLimits[i].MinRad);
 		Joints[i].MaxDeg = FMath::RadiansToDegrees(Default.JointLimits[i].MaxRad);
 		Joints[i].MaxVelDegPerSec = FMath::RadiansToDegrees(Default.JointLimits[i].MaxVelRadPerSec);
+		Joints[i].MaxTorqueNm = Default.JointLimits[i].MaxTorqueNm;
+
+		// 동역학 값은 authoring 단위가 이미 SI라 변환 없이 그대로 옮긴다.
+		const FRobotLinkDynamics& DefaultDynamics = Default.LinkDynamics[i];
+		LinkDynamics[i].MassKg = DefaultDynamics.MassKg;
+		LinkDynamics[i].CenterOfMassLocalM = DefaultDynamics.CenterOfMassLocalM;
+		LinkDynamics[i].InertiaDiagonalKgM2 = DefaultDynamics.InertiaDiagonalKgM2;
+		LinkDynamics[i].RotorInertiaKgM2 = DefaultDynamics.RotorInertiaKgM2;
+		LinkDynamics[i].ViscousFrictionNmsPerRad = DefaultDynamics.ViscousFrictionNmsPerRad;
+		LinkDynamics[i].CoulombFrictionNm = DefaultDynamics.CoulombFrictionNm;
 	}
 
 	// 확정된 KUKA 본 매핑 기본값 (Bone Probe로 확정, STEP_A-01.5b 참조).
@@ -30,14 +41,50 @@ URobotConfig::URobotConfig()
 	JointBoneNames[5] = TEXT("Bone_007"); // J5 툴 roll
 }
 
+namespace RobotConfigSanitize
+{
+	/** 유한하고 양수인 값만 통과시키고, 아니면 폴백으로 대체한다 (질량/관성/토크용). */
+	static double PositiveOrFallback(double Value, double Fallback)
+	{
+		return (FMath::IsFinite(Value) && Value > 0.0) ? Value : Fallback;
+	}
+
+	/** 유한하고 0 이상인 값만 통과시킨다 (마찰/로터 관성용 — 0은 "미모델링"이라 유효). */
+	static double NonNegativeOrFallback(double Value, double Fallback)
+	{
+		return (FMath::IsFinite(Value) && Value >= 0.0) ? Value : Fallback;
+	}
+
+	/** 유한한 벡터만 통과시킨다 (COM은 음수/0 성분도 물리적으로 유효). */
+	static FVector FiniteOrFallback(const FVector& Value, const FVector& Fallback)
+	{
+		return (!Value.ContainsNaN() && FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z))
+			? Value
+			: Fallback;
+	}
+
+	/** 세 성분이 모두 유한하고 양수인 벡터만 통과시킨다 (관성 대각 성분용). */
+	static FVector PositiveComponentsOrFallback(const FVector& Value, const FVector& Fallback)
+	{
+		const bool bValid =
+			FMath::IsFinite(Value.X) && Value.X > 0.0 &&
+			FMath::IsFinite(Value.Y) && Value.Y > 0.0 &&
+			FMath::IsFinite(Value.Z) && Value.Z > 0.0;
+		return bValid ? Value : Fallback;
+	}
+}
+
 FSerial6DoFModel URobotConfig::ToModel() const
 {
-	// 비정상 축(0 벡터 등)은 기본 로봇의 대응 축으로 안전하게 대체한다.
+	using namespace RobotConfigSanitize;
+
+	// 비정상 축(0 벡터 등)과 물리적으로 불가능한 동역학 값은 기본 로봇의 대응 값으로 안전하게 대체한다.
 	const FSerial6DoFModel Fallback = FSerial6DoFModel::CreateDefault();
 
 	FSerial6DoFModel Model;
 	Model.BaseTransform = BaseTransform;
 	Model.ToolOffset = ToolOffset;
+	Model.GravityMPerSec2 = FiniteOrFallback(GravityMPerSec2, Fallback.GravityMPerSec2);
 
 	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 	{
@@ -51,6 +98,19 @@ FSerial6DoFModel URobotConfig::ToModel() const
 		Model.JointLimits[i].MinRad = MinRad;
 		Model.JointLimits[i].MaxRad = MaxRad;
 		Model.JointLimits[i].MaxVelRadPerSec = FMath::DegreesToRadians(FMath::Abs(Joints[i].MaxVelDegPerSec));
+		Model.JointLimits[i].MaxTorqueNm = PositiveOrFallback(Joints[i].MaxTorqueNm, Fallback.JointLimits[i].MaxTorqueNm);
+
+		// 동역학 값은 authoring 단위가 이미 SI → 변환 없이 복사하고, 물리적으로 불가능한 값만 방어한다.
+		const FRobotLinkDynamicsConfig& SourceDynamics = LinkDynamics[i];
+		const FRobotLinkDynamics& FallbackDynamics = Fallback.LinkDynamics[i];
+		FRobotLinkDynamics& TargetDynamics = Model.LinkDynamics[i];
+
+		TargetDynamics.MassKg = PositiveOrFallback(SourceDynamics.MassKg, FallbackDynamics.MassKg);
+		TargetDynamics.CenterOfMassLocalM = FiniteOrFallback(SourceDynamics.CenterOfMassLocalM, FallbackDynamics.CenterOfMassLocalM);
+		TargetDynamics.InertiaDiagonalKgM2 = PositiveComponentsOrFallback(SourceDynamics.InertiaDiagonalKgM2, FallbackDynamics.InertiaDiagonalKgM2);
+		TargetDynamics.RotorInertiaKgM2 = NonNegativeOrFallback(SourceDynamics.RotorInertiaKgM2, FallbackDynamics.RotorInertiaKgM2);
+		TargetDynamics.ViscousFrictionNmsPerRad = NonNegativeOrFallback(SourceDynamics.ViscousFrictionNmsPerRad, FallbackDynamics.ViscousFrictionNmsPerRad);
+		TargetDynamics.CoulombFrictionNm = NonNegativeOrFallback(SourceDynamics.CoulombFrictionNm, FallbackDynamics.CoulombFrictionNm);
 	}
 
 	return Model;
