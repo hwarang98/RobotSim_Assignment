@@ -147,6 +147,43 @@ struct FRobot6DJointState
 };
 
 /**
+ * @struct FRobot6DJointVelocity
+ * @brief 6개 관절 각속도를 담는 관절 공간 상태.
+ *
+ * Step B-02(RNEA)에서 처음 도입됐다. FRobot6DJointState와 같은 규약(plain struct, double[6])을
+ * 따르며, 관절 상태 타입을 한곳에 모아두기 위해 RNEA 헤더가 아니라 여기에 둔다
+ * (Step B-03 순동역학도 같은 타입을 쓴다).
+ */
+struct FRobot6DJointVelocity
+{
+	/** 관절 각속도 Qd[0]~Qd[5] (radian/sec) */
+	double Qd[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+};
+
+/**
+ * @struct FRobot6DJointAcceleration
+ * @brief 6개 관절 각가속도를 담는 관절 공간 상태.
+ */
+struct FRobot6DJointAcceleration
+{
+	/** 관절 각가속도 Qdd[0]~Qdd[5] (radian/sec²) */
+	double Qdd[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+};
+
+/**
+ * @struct FRobot6DJointTorque
+ * @brief 6개 관절 토크를 담는 관절 공간 벡터.
+ *
+ * 단위는 SI(N·m)다 — 동역학 레이어는 전부 SI라는 Step B 규약을 따른다(STEP_B-01.md 참조).
+ * 부호 규약: 관절 축(JointAxes[i]) 양의 방향으로 작용하는 토크가 양수다.
+ */
+struct FRobot6DJointTorque
+{
+	/** 관절 토크 TauNm[0]~TauNm[5] (N·m) */
+	double TauNm[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+};
+
+/**
  * @struct FRobot6DPoseError
  * @brief 현재 EE 자세와 목표 자세 사이의 6D pose error(위치 + 회전).
  *
