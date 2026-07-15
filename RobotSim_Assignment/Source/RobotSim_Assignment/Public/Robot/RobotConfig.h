@@ -160,6 +160,27 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Robot|Visual")
 	FName JointBoneNames[6];
 
+	//~ 시각 파지점 (Visual Grasp Point) ----------------------------------------
+
+	/**
+	 * 그리퍼/흡착판이 달린 본의 이름. ASerial6DoFRobotActor의 VisualGraspPoint 컴포넌트가 이 본에
+	 * 부착되어 메시를 따라다닌다.
+	 *
+	 * @details
+	 * **왜 별도 파지점이 필요한가**: KUKA 메시(3.2m)와 수학 모델(105cm)은 크기가 달라서, 델타 회전
+	 * 리타겟이 본 길이를 메시 고유값으로 유지하는 이상 시각 그리퍼와 수학 EE는 홈 자세에서만 겹치고
+	 * 관절이 돌면 갈라진다(SyncSkeletalPoseToMath 주석 참조). 메시를 수학 크기로 줄이면 겹치지만
+	 * 3.2m 산업용 로봇이 장난감이 된다. 그래서 **메시는 원래 크기/비율 그대로 두고**, 박스는 수학 EE가
+	 * 아니라 이 본에 달린 VisualGraspPoint에 붙인다 — 보이는 그리퍼가 물체를 잡는 것이 우선이다.
+	 *
+	 * 수학 EE는 여전히 IK/FK의 기준이자 검증 대상으로 남는다. 둘의 차이는
+	 * LogVisualToolAlignment()가 "visual calibration offset"으로 보고한다.
+	 *
+	 * 비워두면 VisualGraspPoint는 메시 루트에 붙으며(본을 따라가지 않음) 파지가 어긋난다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Robot|Visual|Grasp")
+	FName VisualGraspBoneName;
+
 	//~ 변환 -------------------------------------------------------------------
 
 	/**

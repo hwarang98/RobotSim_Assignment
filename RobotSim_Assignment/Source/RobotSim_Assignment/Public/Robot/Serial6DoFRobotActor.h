@@ -185,6 +185,40 @@ public:
 
 	#pragma endregion
 
+	#pragma region VisualGraspAPI
+
+	/**
+	 * 시각 파지점(흡착판 끝)의 월드 변환. **박스를 붙이는 기준은 수학 EE가 아니라 이 점이다.**
+	 *
+	 * KUKA 메시는 원래 크기/비율을 유지하므로 시각 그리퍼는 수학 EE와 홈 자세에서만 겹치고 관절이
+	 * 돌면 갈라진다. "보이는 그리퍼가 물체를 잡는다"를 우선하기 위해 파지 기준을 이쪽으로 옮겼다.
+	 * 수학 EE는 IK/FK의 기준이자 검증 대상으로 그대로 남는다(GetEndEffectorPose).
+	 */
+	FTransform GetVisualGraspPointWorld() const;
+
+	/** 시각 파지점이 실제 그리퍼 본에 부착되어 유효한지 (메시/본 이름이 모두 있을 때만 true). */
+	FORCEINLINE bool IsVisualGraspPointAttached() const { return bVisualGraspPointAttached; }
+
+	#pragma endregion
+
+	#pragma region VisualCalibration
+
+	/**
+	 * 현재 자세에서 수학 EE와 시각 파지점 사이의 차이 — **visual calibration offset** — 를 보고한다.
+	 *
+	 * 이 offset은 버그가 아니라 설계상 남기기로 한 값이다: 메시(3.2m)와 수학 모델(105cm)의 크기가 다른데
+	 * 메시를 줄이지 않기로 했으므로, 두 점은 홈 자세에서만 겹치고 관절이 돌수록 벌어진다. 그 크기를
+	 * 숫자로 남겨 문서화하기 위한 함수다.
+	 *
+	 * 홈 자세뿐 아니라 **관절을 돌린 뒤에도** 실행해야 의미가 있다 — 홈에서만 맞고 관절이 돌면 깨지는 것이
+	 * 바로 이번에 파지를 망가뜨린 실패 양상이었고, A-06.1의 ToolOffset 캘리브레이션이 홈 자세만 보고
+	 * 초록불을 준 이유이기도 하다. 읽기 전용이며 아무것도 바꾸지 않는다.
+	 */
+	UFUNCTION(CallInEditor, Category = "Robot|VisualCalibration")
+	void LogVisualToolAlignment();
+
+	#pragma endregion
+
 protected:
 	#pragma region EditorProperties
 
@@ -304,6 +338,18 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category = "Robot")
 	TObjectPtr<UPoseableMeshComponent> SkeletalVisualComponent;
 
+	/**
+	 * 시각 파지점 — KUKA 흡착판 끝을 나타내는 프레임. RobotConfig의 VisualGraspBoneName 본에 부착되어
+	 * 메시를 그대로 따라다닌다. PickPlace가 박스를 붙이는 기준이 바로 이 컴포넌트다.
+	 *
+	 * **에디터에서 이 컴포넌트를 선택해 Relative Transform을 조정하면** 흡착판 정확한 위치에 맞출 수 있다.
+	 * 본 원점이 흡착면과 일치하는 경우는 거의 없으므로 이 미세 조정이 필요하다.
+	 *
+	 * 관절 프레임 체인(JointComponents) 밖에 있으므로 FK/IK에 어떤 영향도 없다.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Robot|Visual")
+	TObjectPtr<USceneComponent> VisualGraspPoint;
+
 	#pragma endregion
 
 private:
@@ -372,6 +418,12 @@ private:
 	/** SkeletalMesh가 표시/동기화 대상인지 (= 에셋 할당됨). ApplySkeletalMeshVisual에서 갱신.
 	 *  개별 관절의 매핑 성공 여부와 무관하다 (미매핑 관절은 sync에서 개별 skip). */
 	bool bSkeletalMeshActive = false;
+
+	/** VisualGraspPoint가 실제 그리퍼 본에 붙었는지. ApplySkeletalMeshVisual에서 갱신. */
+	bool bVisualGraspPointAttached = false;
+
+	/** VisualGraspPoint를 RobotConfig의 VisualGraspBoneName 본에 부착한다 (본이 바뀌면 재부착). */
+	void AttachVisualGraspPointToBone();
 
 	/** 링크 디버그 메시 컴포넌트를 생성하는 생성자 전용 헬퍼 */
 	UStaticMeshComponent* CreateLinkMesh(

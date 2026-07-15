@@ -133,6 +133,11 @@ ASerial6DoFRobotActor::ASerial6DoFRobotActor()
 	SkeletalVisualComponent->SetGenerateOverlapEvents(false);
 	SkeletalVisualComponent->SetVisibility(false); // 에셋/본 매핑이 유효해질 때 ApplySkeletalMeshVisual()이 켠다
 
+	// 시각 파지점 — 실제 본 부착은 ApplySkeletalMeshVisual()이 RobotConfig의 본 이름으로 수행한다
+	// (생성자 시점엔 메시/본 이름을 알 수 없다). 여기서는 메시 루트에 붙여 두기만 한다.
+	VisualGraspPoint = CreateDefaultSubobject<USceneComponent>(TEXT("VisualGraspPoint"));
+	VisualGraspPoint->SetupAttachment(SkeletalVisualComponent);
+
 	// 본 매핑과 SkeletalMesh 에셋은 이제 URobotConfig가 소유한다 (기본값은 URobotConfig 생성자 참조).
 }
 
@@ -255,6 +260,110 @@ void ASerial6DoFRobotActor::ApplyJointState()
 	SyncSkeletalPoseToMath();
 
 	CheckVisualMatchesMath();
+}
+
+void ASerial6DoFRobotActor::AttachVisualGraspPointToBone()
+{
+	if (!VisualGraspPoint || !SkeletalVisualComponent)
+	{
+		return;
+	}
+
+	const FName GraspBone = RobotConfig ? RobotConfig->VisualGraspBoneName : NAME_None;
+	const bool bBoneValid =
+		bSkeletalMeshActive && !GraspBone.IsNone() && SkeletalVisualComponent->GetBoneIndex(GraspBone) != INDEX_NONE;
+
+	// KeepRelative: 에디터에서 사용자가 맞춰 둔 상대 오프셋(흡착면 미세 조정)을 유지한 채 본만 갈아탄다.
+	VisualGraspPoint->AttachToComponent(
+		SkeletalVisualComponent,
+		FAttachmentTransformRules::KeepRelativeTransform,
+		bBoneValid ? GraspBone : NAME_None);
+
+	const bool bWasAttached = bVisualGraspPointAttached;
+	bVisualGraspPointAttached = bBoneValid;
+
+	if (!bBoneValid && !GraspBone.IsNone())
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] 시각 파지 본 '%s'을(를) 메시에서 찾지 못했습니다 — VisualGraspPoint가 메시 루트에 붙어 ")
+			TEXT("그리퍼를 따라가지 않습니다 (박스가 엉뚱한 곳에 붙습니다). 본 이름을 확인하세요."),
+			*GraspBone.ToString());
+	}
+	else if (!bBoneValid && bSkeletalMeshActive)
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] RobotConfig의 VisualGraspBoneName이 비어 있습니다 — 흡착판이 달린 본을 지정해야 ")
+			TEXT("박스가 보이는 그리퍼에 붙습니다."));
+	}
+	else if (bBoneValid && !bWasAttached)
+	{
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor] VisualGraspPoint를 본 '%s'에 부착했습니다 — PickPlace는 이 점을 기준으로 박스를 붙입니다."),
+			*GraspBone.ToString());
+	}
+}
+
+FTransform ASerial6DoFRobotActor::GetVisualGraspPointWorld() const
+{
+	// 파지점이 본에 붙지 않았으면 수학 EE로 폴백한다. 어긋나더라도 사이클이 죽지는 않게 하고,
+	// 원인은 AttachVisualGraspPointToBone()의 Warning이 이미 말해 준다.
+	if (!VisualGraspPoint || !bVisualGraspPointAttached || !SkeletalVisualComponent || !RobotConfig)
+	{
+		return Model.ComputeEndEffectorTransform(CurrentState) * GetActorTransform();
+	}
+
+	// **본 트랜스폼을 직접 읽는다** — VisualGraspPoint->GetComponentTransform()에 의존하지 않는다.
+	//
+	// 이유: 부착된 자식 컴포넌트의 월드 트랜스폼은 PoseableMesh가 본을 갱신할 때 같이 밀어줘야
+	// 최신이 되는데, 그 전파 시점은 우리가 SyncSkeletalPoseToMath를 호출하는 경로와 다를 수 있다.
+	// 한 프레임이라도 밀리면 박스가 그리퍼와 따로 놀고(강체 결합인데도!) 원인이 눈에 안 보인다.
+	// 본 트랜스폼은 메시가 화면에 제대로 그려지는 이상 확실히 최신이므로, 여기서 직접 읽고
+	// 에디터에서 맞춘 상대 오프셋만 얹는 편이 타이밍에 무관하게 항상 옳다.
+	const FTransform BoneWorld = SkeletalVisualComponent->GetBoneTransformByName(
+		RobotConfig->VisualGraspBoneName, EBoneSpaces::WorldSpace);
+
+	return VisualGraspPoint->GetRelativeTransform() * BoneWorld;
+}
+
+void ASerial6DoFRobotActor::LogVisualToolAlignment()
+{
+	if (!bVisualGraspPointAttached)
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[ASerial6DoFRobotActor] VisualGraspPoint가 그리퍼 본에 붙어 있지 않습니다 — RobotConfig의 ")
+			TEXT("VisualGraspBoneName과 SkeletalMesh를 확인하세요."));
+		return;
+	}
+
+	const FVector GraspWorld = GetVisualGraspPointWorld().GetLocation();
+	const FVector MathEEWorld = GetEndEffectorPose().PositionCm;
+	const FVector OffsetWorld = GraspWorld - MathEEWorld;
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor] visual calibration offset — 관절각(도) [%.1f, %.1f, %.1f, %.1f, %.1f, %.1f]"),
+		FMath::RadiansToDegrees(CurrentState.Q[0]), FMath::RadiansToDegrees(CurrentState.Q[1]),
+		FMath::RadiansToDegrees(CurrentState.Q[2]), FMath::RadiansToDegrees(CurrentState.Q[3]),
+		FMath::RadiansToDegrees(CurrentState.Q[4]), FMath::RadiansToDegrees(CurrentState.Q[5]));
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[ASerial6DoFRobotActor]   수학 EE 월드 (%.1f, %.1f, %.1f) / 시각 파지점 월드 (%.1f, %.1f, %.1f) ")
+		TEXT("→ **offset (%.1f, %.1f, %.1f)cm, 크기 %.2fcm**"),
+		MathEEWorld.X, MathEEWorld.Y, MathEEWorld.Z,
+		GraspWorld.X, GraspWorld.Y, GraspWorld.Z,
+		OffsetWorld.X, OffsetWorld.Y, OffsetWorld.Z, OffsetWorld.Size());
+
+	// 이 offset은 버그가 아니라 "메시를 줄이지 않는다"는 결정의 대가다. 자세마다 값이 달라진다는 것이
+	// 핵심이며, 그래서 상수로 뺄 수 없고 PickPlace가 매 단계 반복 보정으로 흡수한다.
+	const bool bAtHome = FMath::IsNearlyZero(CurrentState.Q[1], 1e-3) && FMath::IsNearlyZero(CurrentState.Q[2], 1e-3)
+		&& FMath::IsNearlyZero(CurrentState.Q[4], 1e-3);
+
+	if (bAtHome)
+	{
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[ASerial6DoFRobotActor]   (지금은 홈 자세입니다 — 홈에서 작게 나오는 건 아무것도 증명하지 못합니다. ")
+			TEXT("A-06.1의 ToolOffset 캘리브레이션이 정확히 홈 자세만 보고 초록불을 줬고, 관절이 돌면 깨진다는 걸 ")
+			TEXT("STEP C에서야 알았습니다. J1/J2/J4를 30~60도 돌린 뒤 다시 실행해 값이 얼마나 커지는지 보세요.)"));
+	}
 }
 
 void ASerial6DoFRobotActor::LogEndEffectorPose()
@@ -712,6 +821,10 @@ void ASerial6DoFRobotActor::ApplySkeletalMeshVisual()
 
 	// 에셋만 있으면 표시한다. 개별 관절 매핑 실패는 표시에 영향 없음.
 	SkeletalVisualComponent->SetVisibility(bSkeletalMeshActive && bShowSkeletalMesh);
+
+	// 시각 파지점을 그리퍼 본에 붙인다. 메시는 원래 크기/비율을 유지하므로(축소하지 않는다)
+	// 시각 그리퍼는 수학 EE와 홈 자세에서만 겹친다 — 그래서 박스는 수학 EE가 아니라 이 점에 붙인다.
+	AttachVisualGraspPointToBone();
 
 	if (bSkeletalMeshActive)
 	{
