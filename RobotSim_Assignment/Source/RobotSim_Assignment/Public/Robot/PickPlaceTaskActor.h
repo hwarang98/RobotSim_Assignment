@@ -8,9 +8,73 @@
 #include "Templates/SubclassOf.h"
 #include "PickPlaceTaskActor.generated.h"
 
+class APickPlaceBoxActor;
+class APickPlaceDispatcher;
 class ASerial6DoFRobotActor;
 class UStaticMesh;
 class UStaticMeshComponent;
+
+/**
+ * @struct FPickPlaceTask
+ * @brief 로봇 한 대에게 배급되는 작업 단위 — "이 박스를 저 슬롯에 놓아라".
+ *
+ * 박스와 슬롯을 **한 몸으로** 들고 다니는 것이 핵심이다. 중단 시 박스만 반납하고 슬롯을 빠뜨리면
+ * 그 슬롯이 영구 점유 상태로 새어, 뒤쪽 박스들이 놓을 곳을 잃는다.
+ *
+ * 리플렉션이 필요 없는 순수 데이터라 USTRUCT로 만들지 않는다 (FRobot6DJointState 등과 같은 규약).
+ * Box 포인터의 수명은 dispatcher의 UPROPERTY 배열이 보장한다.
+ *
+ * PickPlaceDispatcher.h가 아니라 여기 있는 이유: 태스크 액터의 AssignTask()가 이 타입을 값으로
+ * 받고 dispatcher는 태스크 액터를 알아야 하므로, 반대로 두면 순환 include가 된다.
+ */
+struct FPickPlaceTask
+{
+	/** 집을 박스 (nullptr이면 미배급 상태). */
+	APickPlaceBoxActor* Box = nullptr;
+
+	/** 놓을 도착지 슬롯 인덱스 (dispatcher의 슬롯 풀 기준). */
+	int32 DestinationSlotIndex = INDEX_NONE;
+
+	/** 실제 작업이 담긴 배급인지. */
+	bool IsValid() const { return Box != nullptr && DestinationSlotIndex != INDEX_NONE; }
+};
+
+/**
+ * @struct FPickPlaceLayout
+ * @brief 표면 위 슬롯 배치와 박스 스폰을 수행하는 순수 헬퍼.
+ *
+ * **dispatcher와 태스크 액터가 공유한다.** 태스크 액터의 멤버 함수로 두면 dispatcher가 같은 로직을
+ * 복제해야 하고, 그러면 두 경로의 배치 규약이 조용히 갈라진다 — 슬롯 Z 계산 하나만 어긋나도
+ * 박스가 상판을 뚫거나 뜬다. 멤버 상태에 의존하지 않는 순수 계산이므로 static으로 승격했다.
+ */
+struct FPickPlaceLayout
+{
+	/**
+	 * 배치된 액터의 **상판 위**에 슬롯 SlotCount개를 자동 배치해 월드 좌표로 반환한다.
+	 *
+	 * - 행은 액터 바운드 중심에 정렬된다 → 개수를 바꿔도 액터를 다시 옮길 필요가 없다
+	 * - StrideCm/OffsetCm은 **액터 로컬 공간**이라 액터를 회전시키면 행도 같이 돈다
+	 * - 상판 높이는 **바운드**에서 읽으므로 메시 피벗 위치와 무관하다
+	 * - Z는 상판 기준으로 덮어쓴다 (액터가 기울어져 있어도 중력 기준으로 쌓아야 하므로)
+	 *
+	 * @param HeightAboveSurfaceCm 상판에서 띄울 높이 (박스 스폰=0, 툴 목표=박스 높이)
+	 * @return 유효한 상판을 얻어 슬롯을 만들었으면 true
+	 */
+	static bool BuildSlotsOnSurface(
+		const AActor* SurfaceActor, int32 SlotCount, const FVector& StrideCm, const FVector& OffsetCm,
+		double HeightAboveSurfaceCm, TArray<FVector>& OutSlotWorld);
+
+	/**
+	 * 슬롯 월드 좌표마다 박스를 하나씩 스폰하고, 각 박스의 **바운드 바닥면**을 그 슬롯 Z에 맞춘다.
+	 *
+	 * 액터 위치가 아니라 바운드로 앉히는 이유: 프롭 메시는 피벗이 바닥/구석에 있는 경우가 흔해
+	 * "액터 위치 = 기하학적 중심"이 성립하지 않는다. 뜬 채로 스폰되면 낙하 중에 파지 지점이
+	 * 스냅샷돼 엉뚱한 곳을 집고, 옆 박스를 밀어내기도 한다.
+	 */
+	static void SpawnBoxesOnSlots(
+		UWorld* World, UClass* BoxClass, const TArray<FVector>& SlotWorld, const FRotator& SpawnRotation,
+		AActor* Owner, TArray<APickPlaceBoxActor*>& OutBoxes);
+};
 
 /**
  * @enum EPickPlacePhase
@@ -219,6 +283,49 @@ public:
 
 	#pragma endregion
 
+	#pragma region DispatcherAPI
+
+	/**
+	 * 지금 새 작업을 받을 수 있는가 (초기화 완료 + 배급 대기 중 + 진행 중인 작업 없음).
+	 *
+	 * `bCycleStarted` 조건이 중요하다: dispatcher는 태스크 액터보다 **먼저** 틱하므로(prerequisite),
+	 * 첫 프레임에는 태스크 액터의 StartCycle이 아직 안 돌았다. 그때 배급하면 곧이어 실행되는
+	 * StartCycle이 Phase를 Idle로 되돌려 배급이 조용히 증발한다.
+	 */
+	bool IsIdle() const;
+
+	/** dispatcher가 작업을 배급한다. 즉시 ToPickApproach로 진입한다. */
+	void AssignTask(const FPickPlaceTask& InTask);
+
+	/** 현재 배급된 작업 (미배급이면 Box == nullptr). */
+	FORCEINLINE const FPickPlaceTask& GetAssignedTask() const { return AssignedTask; }
+
+	/** 구동 중인 로봇 (dispatcher가 베이스 위치/거리 계산에 쓴다). */
+	FORCEINLINE ASerial6DoFRobotActor* GetRobot() const { return Robot; }
+
+	/** 배급 순서 결정론 키 (작을수록 먼저). dispatcher가 이 값으로 정렬한다. */
+	FORCEINLINE int32 GetRobotPriority() const { return RobotPriority; }
+
+	/**
+	 * 이 로봇의 **시각 파지점**이 해당 월드 지점에 도달 가능한가.
+	 *
+	 * "이 로봇이 이 일을 할 수 있는가"에 대한 정직한 술어다 — 사이클의 도달 판정과 **같은 함수**
+	 * (SolveForVisualGraspPoint)를 쓰므로 R3200의 최소 반경(dead zone)까지 반영한다. 별도의 근사
+	 * 판정을 두면 "배급은 됐는데 실행하면 Aborted"가 되어 판정 두 벌이 어긋난다.
+	 *
+	 * 관절 상태를 잠시 움직이지만 반드시 복원한다 — 판정만으로 팔이 튀면 안 된다.
+	 *
+	 * **접근 자세까지 함께 검사한다.** 사이클은 목표 지점만 가는 게 아니라 ApproachOffsetCm만큼
+	 * 위에서 수직 진입/이탈하며, 팔이 위로 뻗을수록 도달 반경이 줄어 **접근 자세가 더 빡빡하다.**
+	 * 목표 지점만 보고 배급하면 접근 단계에서 Aborted가 나고 배급→반납이 반복된다 (실제로 그랬다).
+	 *
+	 * **비싸다**: 내부가 고정점 반복이고 반복마다 DLS(최대 80회)가 돈다. 매 배급마다 부르지 말고
+	 * dispatcher가 사이클 시작 시점에 한 번 캐시할 것.
+	 */
+	bool CanReachGraspPointWorld(const FVector& GraspPointWorld);
+
+	#pragma endregion
+
 	#pragma region EditorUtility
 
 	/**
@@ -270,21 +377,59 @@ protected:
 	TObjectPtr<ASerial6DoFRobotActor> Robot;
 
 	/**
-	 * 처리할 박스들. 배열 순서대로 하나씩 집어 팔레트에 놓는다. 비어 있는(None) 슬롯은 건너뛴다.
+	 * 처리할 박스들. 배열 순서대로 하나씩 집어 놓는다. 비어 있는(None) 슬롯은 건너뛴다.
 	 *
+	 * **standalone 전용** — Dispatcher가 물려 있으면 박스는 dispatcher가 소유하며 이 배열은 쓰이지 않는다.
 	 * bSpawnBoxesOnBeginPlay가 켜져 있으면 BeginPlay에서 **스폰된 박스로 덮어쓴다** — 이때는 레벨에
 	 * 박스를 직접 배치할 필요가 없다. 끄면 여기에 수동 배치한 박스를 할당해 쓴다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Setup")
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Setup",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	TArray<TObjectPtr<APickPlaceBoxActor>> Boxes;
 
 	/** BeginPlay에서 자동으로 사이클을 시작할지 여부. 끄면 StartCycle()을 직접 호출해야 한다. */
 	UPROPERTY(EditAnywhere, Category = "PickPlace|Setup")
 	bool bAutoStartOnBeginPlay = true;
 
+	/**
+	 * 작업을 배급받을 dispatcher. **비워 두면 standalone 모드**로 지금까지와 완전히 동일하게 동작한다
+	 * (자기 Boxes 배열, 자기 스폰, 자기 슬롯).
+	 *
+	 * @details
+	 * dispatcher 모드에서는 박스/슬롯의 소유권이 dispatcher로 넘어간다 — 이 액터는 배급된 작업
+	 * 하나(FPickPlaceTask)를 수행하고 Idle로 돌아가 다음 배급을 기다린다. FSM 9단계 자체는 두 모드가
+	 * 완전히 동일하다.
+	 *
+	 * standalone 폴백을 남겨둔 이유는 보험이다: dispatcher 배선이 틀려도 단일 로봇 데모가 그대로
+	 * 살아 있어야 한다. dispatcher 경로는 **추가지 대체가 아니다.**
+	 */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Setup")
+	TObjectPtr<APickPlaceDispatcher> Dispatcher;
+
+	/**
+	 * 배급 순서를 정하는 우선순위 (작을수록 먼저 배급받는다). 로봇마다 **서로 다른 값**을 줄 것.
+	 *
+	 * @details
+	 * 이 값이 멀티로봇 결정론의 근거다. dispatcher가 배급 대상을 순회하는 순서가 실행마다 달라지면
+	 * 겹친 작업 영역의 박스를 누가 가져갈지가 매번 바뀌어, 고정 타임스텝으로 확보한 결정론이 무의미해진다.
+	 * UE는 액터 간 틱 순서를 보장하지 않으므로(AddTickPrerequisiteActor는 로봇→태스크만 잡는다)
+	 * "먼저 요청한 로봇이 가져간다" 방식은 쓸 수 없다. 명시적 우선순위로 순서를 고정한다.
+	 *
+	 * 같은 값이면 액터 이름(FName)으로 tie-break하므로 여전히 결정론적이지만, 의도를 드러내려면
+	 * 직접 다르게 주는 편이 낫다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Setup")
+	int32 RobotPriority = 0;
+
 	#pragma endregion
 
 	#pragma region Spawning
+
+	//~ 이 섹션은 **standalone 모드 전용**이다. Dispatcher가 물려 있으면 박스/슬롯 소유권이 그쪽으로
+	//~ 넘어가 여기 값들은 읽히지 않으므로, EditConditionHides로 패널에서 숨긴다.
+	//~ (같은 이름의 프로퍼티가 dispatcher에도 있어 둘 다 보이면 어느 쪽이 실제로 쓰이는지 헷갈린다 —
+	//~  실제로 "Num Boxes To Spawn을 어디서 바꾸나"에서 혼선이 났다.)
+	//~ 코드 경로 자체는 그대로 살아 있다: Dispatcher를 비우면 C-01과 동일하게 동작하는 보험이다.
 
 	/**
 	 * BeginPlay에서 박스를 자동 스폰할지 여부.
@@ -292,7 +437,8 @@ protected:
 	 * 켜두는 것을 권장한다. 레벨에 손으로 배치하면 로봇 작업 반경 밖에 두기 쉽고(그러면 IK가 실패한다)
 	 * 로봇을 옮길 때마다 다시 배치해야 하지만, 스폰은 좌표가 로봇 기준이라 항상 반경 안에 들어온다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning")
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	bool bSpawnBoxesOnBeginPlay = true;
 
 	/**
@@ -300,11 +446,13 @@ protected:
 	 * 비어 있으면 C++ 기본 APickPlaceBoxActor(15cm 회색 큐브)를 쓴다.
 	 * 파지 높이는 실제 바운드에서 읽으므로 BP에서 크기를 바꿔도 코드는 그대로 동작한다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning", meta = (EditCondition = "bSpawnBoxesOnBeginPlay"))
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning",
+		meta = (EditCondition = "Dispatcher == nullptr && bSpawnBoxesOnBeginPlay", EditConditionHides))
 	TSubclassOf<APickPlaceBoxActor> BoxClass;
 
 	/** 스폰할 박스 개수. */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning", meta = (ClampMin = "1", EditCondition = "bSpawnBoxesOnBeginPlay"))
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Spawning",
+		meta = (ClampMin = "1", EditCondition = "Dispatcher == nullptr && bSpawnBoxesOnBeginPlay", EditConditionHides))
 	int32 NumBoxesToSpawn = 3;
 
 	//~ 배치 좌표는 여기에 없다 — 출발지/도착지 모두 Layout의 배치된 액터를 읽는다.
@@ -322,35 +470,43 @@ protected:
 	 * 로봇 로컬 변환이 전부 곱해져 어디로 갈지 예측이 안 된다(실제로 그래서 엉뚱한 곳에 스폰됐다).
 	 * 뷰포트에서 원하는 곳에 끌어다 놓은 그 트랜스폼이 곧 정답이므로 읽기만 한다.
 	 *
-	 * 슬롯은 이 액터 기준으로 자동 배치된다 (BuildSlotsOnSurface 참조):
-	 * - 위치: 액터 로컬 공간에서 stride 간격, 행 중앙이 액터 중심에 오도록 정렬
+	 * 슬롯은 이 액터 기준으로 자동 배치된다 (FPickPlaceLayout::BuildSlotsOnSurface 참조):
+	 * - 위치: 액터 로컬 공간에서 stride 간격, 행 중앙이 **바운드 중심**에 오도록 정렬
 	 * - 방향: 액터를 회전시키면 슬롯 행도 같이 돈다
 	 * - 높이: **바운드 윗면** → 피벗이 어디 있든 박스가 상판에 정확히 앉는다
+	 *
+	 * **standalone 전용** — Dispatcher가 물려 있으면 dispatcher의 동명 프로퍼티가 쓰이고 이 값은 무시된다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	TObjectPtr<AActor> SourceSurfaceActor;
 
-	/** 출발지 슬롯 간격 (cm, **출발지 액터 로컬 공간**). 단층 1열 — N층 적재/해체는 범위 밖이다. */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	/** 출발지 슬롯 간격 (cm, **출발지 액터 로컬 공간**). standalone 전용. 단층 1열 — N층 적재/해체는 범위 밖이다. */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	FVector SourceSlotStrideCm = FVector(0.0, 40.0, 0.0);
 
-	/** 출발지 슬롯 행 미세 조정 (cm, 출발지 액터 로컬). 0이면 행이 액터 바운드 중심에 정렬된다. */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	/** 출발지 슬롯 행 미세 조정 (cm, 출발지 액터 로컬). standalone 전용. 0이면 행이 바운드 중심에 정렬된다. */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	FVector SourceSlotOffsetCm = FVector::ZeroVector;
 
 	/**
-	 * **도착지** — 박스를 이 액터의 상판 위에 갖다 놓는다 (레일/컨베이어).
+	 * **도착지** — 박스를 이 액터의 상판 위에 갖다 놓는다 (레일/컨베이어). standalone 전용.
 	 * 규약은 SourceSurfaceActor와 완전히 동일하다.
 	 */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	TObjectPtr<AActor> DestinationSurfaceActor;
 
-	/** 도착지 슬롯 간격 (cm, **도착지 액터 로컬 공간**). */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	/** 도착지 슬롯 간격 (cm, **도착지 액터 로컬 공간**). standalone 전용. */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	FVector DestinationSlotStrideCm = FVector(0.0, 40.0, 0.0);
 
-	/** 도착지 슬롯 행 미세 조정 (cm, 도착지 액터 로컬). */
-	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout")
+	/** 도착지 슬롯 행 미세 조정 (cm, 도착지 액터 로컬). standalone 전용. */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Layout",
+		meta = (EditCondition = "Dispatcher == nullptr", EditConditionHides))
 	FVector DestinationSlotOffsetCm = FVector::ZeroVector;
 
 	/**
@@ -455,7 +611,14 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "PickPlace|Logging")
 	bool bEnableCsvLogging = true;
 
-	/** CSV 파일명. 저장 경로는 <Project>/Saved/RobotSim/<CsvFileName>. */
+	/**
+	 * CSV 파일명. 저장 경로는 <Project>/Saved/RobotSim/<CsvFileName>.
+	 *
+	 * **멀티로봇 주의**: 같은 이름을 쓰는 태스크 액터가 둘 이상이면 서로 덮어써서 한쪽 데이터가
+	 * 조용히 사라진다. StartCycle이 그 충돌을 감지하면 **양쪽 모두** 액터 이름을 붙여 자동으로
+	 * 구분하고 Warning을 남긴다 (한쪽만 붙이면 어느 파일이 누구 것인지 알 수 없어 비대칭이 된다).
+	 * 자동 구분에 기대지 말고 로봇마다 이름을 직접 주는 편이 읽기 좋다.
+	 */
 	UPROPERTY(EditAnywhere, Category = "PickPlace|Logging")
 	FString CsvFileName = TEXT("PickPlace.csv");
 
@@ -503,6 +666,12 @@ private:
 	 * AddTickPrerequisiteActor는 Tick 순서만 보장하지 BeginPlay 순서는 보장하지 않는다.
 	 */
 	bool bPendingAutoStart = false;
+
+	/** StartCycle이 실행됐는지. dispatcher가 배급 가능 여부를 판단하는 조건 (IsIdle 주석 참조). */
+	bool bCycleStarted = false;
+
+	/** dispatcher가 배급한 현재 작업 (standalone 모드에서는 항상 비어 있다). */
+	FPickPlaceTask AssignedTask;
 
 	#pragma endregion
 
@@ -553,6 +722,12 @@ private:
 	/** CSV 행 버퍼. 사이클 종료(Done/Aborted) 또는 EndPlay/FlushCsvNow 시 파일로 기록한다. */
 	TArray<FString> CsvRows;
 
+	/**
+	 * 실제로 기록할 CSV 파일명. StartCycle이 다른 태스크 액터와의 충돌을 검사해 확정한다.
+	 * 충돌이 없으면 CsvFileName 그대로, 있으면 액터 이름이 붙는다. 비어 있으면 아직 미확정이다.
+	 */
+	FString ResolvedCsvFileName;
+
 	#pragma endregion
 
 	#pragma region Internal
@@ -598,34 +773,17 @@ private:
 	void LogReachableRadiusBand(const FVector& DirectionXY, double ZLocal, const TCHAR* Label);
 
 	/**
-	 * 배치된 액터의 **상판 위**에 슬롯 SlotCount개를 자동 배치해 월드 좌표로 반환한다.
-	 *
-	 * 출발지(박스 스폰)와 도착지(적재) 양쪽이 이 함수 하나를 공유한다 — 두 곳 다 "배치된 액터를 읽는다"는
-	 * 같은 규약이기 때문이다. 좌표를 계산해 맞추려던 시도가 오늘 실패의 대부분이었고, 배치된 것을 읽는
-	 * 쪽으로 통일하니 지지면 트레이스와 로봇 로컬 좌표 추측이 통째로 사라졌다.
-	 *
-	 * - 행은 액터 바운드 중심에 정렬된다 → 박스 개수를 바꿔도 액터를 다시 옮길 필요가 없다
-	 * - StrideCm/OffsetCm은 **액터 로컬 공간**이라 액터를 회전시키면 행도 같이 돈다
-	 * - 상판 높이는 **바운드**에서 읽으므로 메시 피벗 위치와 무관하다
-	 * - Z는 상판 기준으로 덮어쓴다 (액터가 기울어져 있어도 중력 기준으로 쌓아야 하므로)
-	 *
-	 * @param SurfaceActor          기준 액터 (nullptr이면 false)
-	 * @param SlotCount             슬롯 개수
-	 * @param StrideCm              슬롯 간격 (액터 로컬)
-	 * @param OffsetCm              행 전체 미세 조정 (액터 로컬)
-	 * @param HeightAboveSurfaceCm  상판에서 띄울 높이 (스폰=0, 툴 목표=박스 높이)
-	 * @param OutSlotWorld          결과 슬롯 월드 좌표
-	 * @return 유효한 상판을 얻어 슬롯을 만들었으면 true
-	 */
-	bool BuildSlotsOnSurface(
-		const AActor* SurfaceActor, int32 SlotCount, const FVector& StrideCm, const FVector& OffsetCm,
-		double HeightAboveSurfaceCm, TArray<FVector>& OutSlotWorld) const;
-
-	/**
 	 * 도착지 슬롯별 툴 목표 위치를 확정해 PalletSlotLocations(로봇 공간)를 채운다.
+	 * **standalone 모드 전용** — dispatcher 모드에서는 dispatcher가 슬롯을 소유한다.
 	 * @param BoxHeightCm 박스 전체 높이. 파지점이 박스 윗면이므로 툴 목표 Z = 상판 + 이 값이다.
 	 */
 	void BuildPalletSlots(double BoxHeightCm);
+
+	/** 현재 처리 중인 박스 — dispatcher 모드면 배급된 박스, standalone이면 Boxes[CurrentBoxIndex]. */
+	APickPlaceBoxActor* GetCurrentBox() const;
+
+	/** 현재 작업의 도착지 슬롯 자세 (로봇 공간). 모드에 따라 dispatcher 슬롯 풀 또는 자기 슬롯을 읽는다. */
+	FTransform GetCurrentPlacePoseLocal(bool bApproach) const;
 
 	/**
 	 * 목표 툴 팁 자세(로봇 공간)를 향해 IK를 풀고 TrajectoryStart/Goal/Duration을 설정한다.
@@ -687,7 +845,15 @@ private:
 	/** 현재 스텝의 물리값을 CSV 행 하나로 버퍼에 추가한다. */
 	void RecordCsvRow();
 
-	/** CSV 버퍼를 <Project>/Saved/RobotSim/<CsvFileName>에 기록하고 버퍼를 비운다. */
+	/**
+	 * 다른 태스크 액터와 CSV 파일명이 겹치는지 검사해 ResolvedCsvFileName을 확정한다.
+	 *
+	 * 겹치면 서로 덮어써서 한쪽 데이터가 **조용히** 사라진다 — 로그도 에러도 없이 파일 하나만 남으므로
+	 * 멀티로봇에서 가장 놓치기 쉬운 실수다. 충돌 시 양쪽 모두 액터 이름을 붙여 구분한다.
+	 */
+	void ResolveCsvFileName();
+
+	/** CSV 버퍼를 <Project>/Saved/RobotSim/<ResolvedCsvFileName>에 기록하고 버퍼를 비운다. */
 	void WriteCsvToDisk();
 
 	/** 단계 이름을 로그/CSV용 문자열로 반환한다. */

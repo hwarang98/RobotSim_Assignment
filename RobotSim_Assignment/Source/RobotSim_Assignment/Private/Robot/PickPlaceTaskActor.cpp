@@ -5,12 +5,14 @@
 #include "Components/PoseableMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Engine.h"
+#include "EngineUtils.h"
 #include "Engine/SkinnedAsset.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Robot/PickPlaceDispatcher.h"
 #include "Robot/RobotDlsIK.h"
 #include "Robot/RobotSimLog.h"
 #include "Robot/Serial6DoFModel.h"
@@ -178,8 +180,16 @@ void APickPlaceTaskActor::BeginPlay()
 	// 로봇 → 태스크 순서를 보장하면, 로봇 클래스를 한 줄도 고치지 않고 되쓰기 위에 결과를 얹을 수 있다.
 	AddTickPrerequisiteActor(Robot);
 
-	if (bSpawnBoxesOnBeginPlay)
+	if (Dispatcher)
 	{
+		// dispatcher 모드: 박스/슬롯 소유권이 dispatcher로 넘어간다. 스폰하지 않는다.
+		// dispatcher가 먼저 틱해야 배급이 같은 프레임에 반영되므로 prerequisite을 하나 더 건다.
+		Dispatcher->RegisterTaskActor(this);
+		AddTickPrerequisiteActor(Dispatcher);
+	}
+	else if (bSpawnBoxesOnBeginPlay)
+	{
+		// standalone 폴백 — dispatcher 없이도 지금까지와 완전히 동일하게 동작한다.
 		SpawnBoxes();
 	}
 
@@ -194,6 +204,14 @@ void APickPlaceTaskActor::BeginPlay()
 
 void APickPlaceTaskActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// 진행 중이던 배급을 반납한다 (박스 + 슬롯). PIE 종료 시엔 실질적 영향이 없지만,
+	// 반납 이벤트가 Dispatch.csv에 남아야 "끝날 때 무엇이 진행 중이었나"를 읽을 수 있다.
+	if (Dispatcher && AssignedTask.IsValid())
+	{
+		Dispatcher->ReturnTask(this, AssignedTask, /*bBlacklist=*/false, TEXT("EndPlay"));
+		AssignedTask = FPickPlaceTask();
+	}
+
 	// 사이클이 Done에 도달하기 전에 PIE를 멈춰도 그때까지의 샘플은 남긴다.
 	WriteCsvToDisk();
 
@@ -221,15 +239,17 @@ void APickPlaceTaskActor::Tick(float DeltaSeconds)
 				PhaseToString(Phase), CurrentBoxIndex + 1, Boxes.Num(), SimTimeSec));
 	}
 
-	// Idle에서는 로봇이 스스로를 소유한다 (STEP A 동작 그대로). 아래 SetJointAngles로 개입하지 않는다.
-	if (Phase == EPickPlacePhase::Idle)
+	// standalone의 Idle은 "이 액터가 관절을 소유하지 않는다"는 뜻이므로 로봇에게 돌려준다
+	// (STEP A 동작 그대로). 반면 **dispatcher 모드의 Idle은 "다음 배급 대기"** 라 자세를 유지해야 한다 —
+	// 놓으면 작업 사이마다 팔이 홈 자세로 튕겨 데모가 경련한다.
+	if (Phase == EPickPlacePhase::Idle && !Dispatcher)
 	{
 		return;
 	}
 
-	// Done/Aborted에서는 FSM을 더 전진시키지 않지만 SetJointAngles는 계속해야 한다.
+	// Idle(dispatcher 대기)/Done/Aborted에서는 FSM을 전진시키지 않지만 SetJointAngles는 계속해야 한다.
 	// 멈추면 로봇 Tick의 JointAnglesDeg 되쓰기가 다시 이겨서 팔이 홈 자세로 튕겨 돌아간다.
-	if (Phase != EPickPlacePhase::Done && Phase != EPickPlacePhase::Aborted)
+	if (Phase != EPickPlacePhase::Idle && Phase != EPickPlacePhase::Done && Phase != EPickPlacePhase::Aborted)
 	{
 		// 고정 타임스텝 적분: 프레임 시간을 누적해 FixedTimeStepSec 단위로만 FSM을 전진시킨다.
 		// 프레임레이트가 흔들려도 궤적 형상과 CSV 샘플 간격이 동일하게 나온다.
@@ -283,8 +303,11 @@ void APickPlaceTaskActor::SpawnBoxes()
 
 	// 출발지 상판 위에 슬롯을 잡는다. HeightAboveSurface=0 — 슬롯 Z가 곧 박스 **바닥**이 앉을 높이다.
 	// (도착지는 툴 목표라 박스 높이만큼 띄운다. 같은 함수, 다른 인자 — 규약이 하나라 헷갈릴 일이 없다.)
+	//
+	// dispatcher도 이 함수들을 그대로 쓴다. 배치 규약을 한 곳에 두지 않으면 두 경로가 조용히
+	// 갈라져 박스가 상판을 뚫거나 뜬다.
 	TArray<FVector> SlotWorld;
-	if (!BuildSlotsOnSurface(SourceSurfaceActor, NumBoxesToSpawn, SourceSlotStrideCm,
+	if (!FPickPlaceLayout::BuildSlotsOnSurface(SourceSurfaceActor, NumBoxesToSpawn, SourceSlotStrideCm,
 			SourceSlotOffsetCm, /*HeightAboveSurfaceCm=*/0.0, SlotWorld))
 	{
 		UE_LOG(LogRobotSim, Warning,
@@ -293,71 +316,20 @@ void APickPlaceTaskActor::SpawnBoxes()
 		return;
 	}
 
-	UClass* ClassToSpawn = BoxClass ? BoxClass.Get() : APickPlaceBoxActor::StaticClass();
+	TArray<APickPlaceBoxActor*> SpawnedBoxes;
+	FPickPlaceLayout::SpawnBoxesOnSlots(World, BoxClass ? BoxClass.Get() : APickPlaceBoxActor::StaticClass(),
+		SlotWorld, SourceSurfaceActor->GetActorRotation(), this, SpawnedBoxes);
 
-	for (int32 i = 0; i < SlotWorld.Num(); ++i)
+	for (APickPlaceBoxActor* Box : SpawnedBoxes)
 	{
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-		SpawnParams.Owner = this;
-
-		// 먼저 슬롯 위치에 스폰한다. 실제 바운드는 스폰 후에만 알 수 있고, 그 값이 있어야
-		// "상판 위에 정확히" 앉힐 수 있다. 회전은 출발지 액터를 따라간다(팔레트 위에 정렬돼 보이도록).
-		const FTransform SpawnTransform(SourceSurfaceActor->GetActorRotation(), SlotWorld[i]);
-		APickPlaceBoxActor* Box = World->SpawnActor<APickPlaceBoxActor>(ClassToSpawn, SpawnTransform, SpawnParams);
-
-		if (!Box)
-		{
-			UE_LOG(LogRobotSim, Warning, TEXT("[APickPlaceTaskActor] 박스 %d 스폰 실패 (BoxClass 확인)"), i);
-			continue;
-		}
-
-		// 박스 바닥이 상판에 정확히 닿게 앉힌다. 뜬 채로 스폰되면 낙하 중에 파지 지점이 스냅샷돼
-		// 엉뚱한 곳을 집게 되고, 옆 박스를 밀어내기도 한다.
-		//
-		// 액터 위치가 아니라 **바운드 바닥면**을 기준으로 보정한다. 프롭 메시는 피벗이 바닥이나
-		// 구석에 있는 경우가 흔해서 "액터 위치 = 기하학적 중심"이 성립하지 않는다 —
-		// 그 가정 때문에 박스가 절반 높이만큼 뜬 채 스폰돼 떨어졌다.
-		const double DropZ = SlotWorld[i].Z - Box->GetBoundsBottomZWorld();
-		Box->AddActorWorldOffset(FVector(0.0, 0.0, DropZ),
-			/*bSweep=*/false, /*OutSweepHitResult=*/nullptr, ETeleportType::TeleportPhysics);
-
 		Boxes.Add(Box);
-
-		const FVector GraspLocal = Robot->GetActorTransform().InverseTransformPosition(Box->GetGraspPointWorld());
-		UE_LOG(LogRobotSim, Log,
-			TEXT("[APickPlaceTaskActor] 박스 %d 스폰 — 월드 (%.1f, %.1f, %.1f)cm, 높이 %.1fcm, ")
-			TEXT("파지점(윗면 중심) 로봇공간 (%.1f, %.1f, %.1f)cm [XY반경 %.1fcm]"),
-			i, Box->GetActorLocation().X, Box->GetActorLocation().Y, Box->GetActorLocation().Z, Box->GetHeightCm(),
-			GraspLocal.X, GraspLocal.Y, GraspLocal.Z, FVector2D(GraspLocal.X, GraspLocal.Y).Size());
 	}
 
+	// 간격/표면 크기 검사는 FPickPlaceLayout이 한다 (dispatcher 경로도 같은 검사를 받아야 하므로).
 	UE_LOG(LogRobotSim, Log,
 		TEXT("[APickPlaceTaskActor] 출발지 '%s' 상판에 박스 %d개 스폰 — 간격 (%.0f, %.0f, %.0f)cm"),
 		*SourceSurfaceActor->GetName(), Boxes.Num(),
 		SourceSlotStrideCm.X, SourceSlotStrideCm.Y, SourceSlotStrideCm.Z);
-
-	// 간격이 박스 크기보다 좁으면 스폰 순간 서로 겹쳐 물리가 밀어낸다. 그러면 박스가 파지 지점
-	// 스냅샷에서 벗어나 흡착판이 빈 곳을 집는데, 겉보기엔 "IK가 이상하다"로 보여 원인을 찾기 어렵다.
-	// 조용히 틀리는 종류라 여기서 미리 말한다.
-	if (Boxes.Num() >= 2 && Boxes[0])
-	{
-		// 간격 방향으로 박스가 차지하는 폭. 바운드는 월드 AABB이므로 방향 성분의 절대값 합으로 근사한다.
-		const FVector Extent = Boxes[0]->GetBoundsExtentCm();
-		const FVector StrideDir = SourceSlotStrideCm.GetSafeNormal();
-		const double BoxWidthAlongStride =
-			2.0 * (FMath::Abs(Extent.X * StrideDir.X) + FMath::Abs(Extent.Y * StrideDir.Y) + FMath::Abs(Extent.Z * StrideDir.Z));
-		const double StrideLen = SourceSlotStrideCm.Size();
-
-		if (StrideLen < BoxWidthAlongStride)
-		{
-			UE_LOG(LogRobotSim, Warning,
-				TEXT("[APickPlaceTaskActor] **SourceSlotStrideCm이 너무 좁습니다** — 간격 %.1fcm < 박스 폭 %.1fcm. ")
-				TEXT("스폰 순간 박스들이 겹쳐 물리가 서로 밀어내고, 그러면 파지 지점 스냅샷이 어긋나 흡착판이 빈 곳을 집습니다. ")
-				TEXT("간격을 %.0fcm 이상으로 키우세요."),
-				StrideLen, BoxWidthAlongStride, FMath::CeilToDouble(BoxWidthAlongStride * 1.1));
-		}
-	}
 }
 
 void APickPlaceTaskActor::LogReachableRadiusBand(const FVector& DirectionXY, double ZLocal, const TCHAR* Label)
@@ -429,9 +401,11 @@ void APickPlaceTaskActor::LogReachableRadiusBand(const FVector& DirectionXY, dou
 		FirstReachable, LastReachable, WorstErrorInBandCm);
 }
 
-bool APickPlaceTaskActor::BuildSlotsOnSurface(
+#pragma region FPickPlaceLayout
+
+bool FPickPlaceLayout::BuildSlotsOnSurface(
 	const AActor* SurfaceActor, int32 SlotCount, const FVector& StrideCm, const FVector& OffsetCm,
-	double HeightAboveSurfaceCm, TArray<FVector>& OutSlotWorld) const
+	double HeightAboveSurfaceCm, TArray<FVector>& OutSlotWorld)
 {
 	OutSlotWorld.Reset();
 
@@ -454,24 +428,133 @@ bool APickPlaceTaskActor::BuildSlotsOnSurface(
 	const double SurfaceTopWorldZ = SurfaceBounds.Max.Z;
 	const FTransform SurfaceToWorld = SurfaceActor->GetActorTransform();
 
+	// 행의 기준은 액터 피벗이 아니라 **바운드 중심**이다. 프롭 메시는 피벗이 한쪽 끝이나 구석에 있는
+	// 경우가 흔해서(실제로 BP_Pallet은 피벗이 바운드 끝에 있어 행의 절반이 상판 밖으로 나갔다)
+	// 피벗을 기준으로 잡으면 행이 표면에서 벗어난다. 박스 파지점·상판 높이를 바운드로 계산해
+	// 피벗 독립으로 만들어 둔 것과 같은 이유이자 같은 방법이다.
+	const FVector RowCenterWorld = SurfaceBounds.GetCenter();
+
+	// 간격/오프셋은 액터 로컬 공간의 **방향**이므로 위치가 아니라 벡터로 변환한다 —
+	// 액터를 회전시키면 행도 같이 돌되, 피벗 위치에는 영향받지 않는다.
+	const FVector StrideWorld = SurfaceToWorld.TransformVector(StrideCm);
+	const FVector OffsetWorld = SurfaceToWorld.TransformVector(OffsetCm);
+
 	for (int32 i = 0; i < SlotCount; ++i)
 	{
-		// 행을 액터 중심에 맞춰 정렬한다: i - (N-1)/2 → 짝수 개면 중심 양옆, 홀수 개면 가운데가 중심.
+		// 행을 중심에 맞춰 정렬한다: i - (N-1)/2 → 짝수 개면 중심 양옆, 홀수 개면 가운데가 중심.
 		// 이렇게 하면 박스 개수를 바꿔도 액터를 다시 옮길 필요가 없다.
 		const double Centered = static_cast<double>(i) - (static_cast<double>(SlotCount) - 1.0) * 0.5;
 
-		// 액터 로컬 → 월드. 액터를 회전시키면 슬롯 행도 같이 돈다.
-		FVector SlotWorld = SurfaceToWorld.TransformPosition(OffsetCm + StrideCm * Centered);
+		FVector SlotWorld = RowCenterWorld + OffsetWorld + StrideWorld * Centered;
 
-		// XY는 액터 로컬을 따르되 Z만 상판 기준으로 덮어쓴다 — 액터가 조금 기울어져 있어도
+		// XY는 위에서 정해지고 Z만 상판 기준으로 덮어쓴다 — 액터가 조금 기울어져 있어도
 		// 박스는 중력 기준 수평으로 놓여야 하기 때문이다.
 		SlotWorld.Z = SurfaceTopWorldZ + HeightAboveSurfaceCm;
 
 		OutSlotWorld.Add(SlotWorld);
 	}
 
+	// 슬롯이 상판 밖으로 나가면 그 자리 박스는 **허공에 상판 높이로** 스폰돼 떨어진다 (Z는 상판 기준으로
+	// 일괄 계산하므로 XY가 표면을 벗어나도 높이만 맞는다). 떨어지면서 서로 부딪혀 흩어지고, 낙하 중에
+	// 파지 지점이 스냅샷되면 엉뚱한 곳을 집는다 — 겉보기엔 "박스가 이상하게 흩어진다"로만 보인다.
+	int32 OutsideCount = 0;
+	for (const FVector& Slot : OutSlotWorld)
+	{
+		if (!SurfaceBounds.IsInsideXY(Slot))
+		{
+			++OutsideCount;
+		}
+	}
+
+	if (OutsideCount > 0)
+	{
+		const FVector SurfaceSize = SurfaceBounds.GetSize();
+		const double RowLengthCm = StrideCm.Size() * static_cast<double>(SlotCount - 1);
+
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[FPickPlaceLayout] '%s' 상판 밖으로 나간 슬롯 %d/%d개 — 그 자리 박스는 허공에서 떨어져 흩어집니다. ")
+			TEXT("슬롯 행 길이 %.0fcm (간격 %.0f × %d칸) vs 상판 크기 (%.0f × %.0f)cm. ")
+			TEXT("→ 개수(SlotCount %d)를 줄이거나, 간격을 줄이거나, 더 큰 표면을 쓰세요."),
+			*SurfaceActor->GetName(), OutsideCount, SlotCount, RowLengthCm,
+			StrideCm.Size(), SlotCount - 1, SurfaceSize.X, SurfaceSize.Y, SlotCount);
+	}
+
 	return true;
 }
+
+void FPickPlaceLayout::SpawnBoxesOnSlots(
+	UWorld* World, UClass* BoxClass, const TArray<FVector>& SlotWorld, const FRotator& SpawnRotation,
+	AActor* Owner, TArray<APickPlaceBoxActor*>& OutBoxes)
+{
+	OutBoxes.Reset();
+
+	if (!World || !BoxClass)
+	{
+		return;
+	}
+
+	for (int32 i = 0; i < SlotWorld.Num(); ++i)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		SpawnParams.Owner = Owner;
+
+		// 먼저 슬롯 위치에 스폰한다. 실제 바운드는 스폰 후에만 알 수 있고, 그 값이 있어야
+		// "상판 위에 정확히" 앉힐 수 있다. 회전은 출발지 액터를 따라간다(상판 위에 정렬돼 보이도록).
+		APickPlaceBoxActor* Box =
+			World->SpawnActor<APickPlaceBoxActor>(BoxClass, FTransform(SpawnRotation, SlotWorld[i]), SpawnParams);
+
+		if (!Box)
+		{
+			UE_LOG(LogRobotSim, Warning, TEXT("[FPickPlaceLayout] 박스 %d 스폰 실패 (BoxClass 확인)"), i);
+			continue;
+		}
+
+		// 박스 바닥이 상판에 정확히 닿게 앉힌다. 뜬 채로 스폰되면 낙하 중에 파지 지점이 스냅샷돼
+		// 엉뚱한 곳을 집게 되고, 옆 박스를 밀어내기도 한다.
+		//
+		// 액터 위치가 아니라 **바운드 바닥면**을 기준으로 보정한다. 프롭 메시는 피벗이 바닥이나
+		// 구석에 있는 경우가 흔해서 "액터 위치 = 기하학적 중심"이 성립하지 않는다.
+		const double DropZ = SlotWorld[i].Z - Box->GetBoundsBottomZWorld();
+		Box->AddActorWorldOffset(FVector(0.0, 0.0, DropZ),
+			/*bSweep=*/false, /*OutSweepHitResult=*/nullptr, ETeleportType::TeleportPhysics);
+
+		OutBoxes.Add(Box);
+
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[FPickPlaceLayout] 박스 %d 스폰 — 월드 (%.1f, %.1f, %.1f)cm, 높이 %.1fcm, 파지점(윗면 중심) (%.1f, %.1f, %.1f)cm"),
+			i, Box->GetActorLocation().X, Box->GetActorLocation().Y, Box->GetActorLocation().Z, Box->GetHeightCm(),
+			Box->GetGraspPointWorld().X, Box->GetGraspPointWorld().Y, Box->GetGraspPointWorld().Z);
+	}
+
+	// 슬롯 간격이 박스 크기보다 좁으면 스폰 순간 서로 겹쳐 물리가 밀어낸다. 그러면 박스가 파지 지점
+	// 스냅샷에서 벗어나 흡착판이 빈 곳을 집는데, 겉보기엔 "박스가 흩어진다 / IK가 이상하다"로 보여
+	// 원인을 찾기 어렵다. 조용히 틀리는 종류라 실측값으로 미리 말한다.
+	//
+	// 간격은 stride 파라미터가 아니라 **실제 슬롯 사이 거리**로 잰다 — 이 함수는 슬롯을 어떻게 만들었는지
+	// 모르고, 알 필요도 없다.
+	if (OutBoxes.Num() >= 2 && OutBoxes[0])
+	{
+		const double GapCm = FVector::Dist(SlotWorld[0], SlotWorld[1]);
+		const FVector Extent = OutBoxes[0]->GetBoundsExtentCm();
+		const FVector GapDir = (SlotWorld[1] - SlotWorld[0]).GetSafeNormal();
+
+		// 바운드는 월드 AABB이므로, 간격 방향으로 박스가 차지하는 폭은 성분 절대값 합으로 근사한다.
+		const double BoxWidthAlongGap = 2.0 * (FMath::Abs(Extent.X * GapDir.X)
+			+ FMath::Abs(Extent.Y * GapDir.Y) + FMath::Abs(Extent.Z * GapDir.Z));
+
+		if (GapCm < BoxWidthAlongGap)
+		{
+			UE_LOG(LogRobotSim, Warning,
+				TEXT("[FPickPlaceLayout] **슬롯 간격이 박스보다 좁습니다** — 간격 %.1fcm < 박스 폭 %.1fcm. ")
+				TEXT("스폰 순간 박스들이 겹쳐 물리가 서로 밀어내고, 그러면 파지 지점 스냅샷이 어긋나 ")
+				TEXT("흡착판이 빈 곳을 집습니다. 간격을 **%.0fcm 이상**으로 키우세요."),
+				GapCm, BoxWidthAlongGap, FMath::CeilToDouble(BoxWidthAlongGap * 1.1));
+		}
+	}
+}
+
+#pragma endregion
 
 void APickPlaceTaskActor::BuildPalletSlots(double BoxHeightCm)
 {
@@ -486,7 +569,7 @@ void APickPlaceTaskActor::BuildPalletSlots(double BoxHeightCm)
 	// 전체 높이만큼 매달려 있으므로, 툴이 이 높이면 박스 바닥이 상판에 닿는다.
 	// (파지점을 중심으로 잡던 시절엔 절반 높이였다 — 파지 규약과 반드시 함께 바뀌어야 하는 값이다.)
 	TArray<FVector> SlotWorld;
-	if (!BuildSlotsOnSurface(DestinationSurfaceActor, Boxes.Num(), DestinationSlotStrideCm,
+	if (!FPickPlaceLayout::BuildSlotsOnSurface(DestinationSurfaceActor, Boxes.Num(), DestinationSlotStrideCm,
 			DestinationSlotOffsetCm, BoxHeightCm + PlaceClearanceCm, SlotWorld))
 	{
 		UE_LOG(LogRobotSim, Warning,
@@ -540,6 +623,9 @@ void APickPlaceTaskActor::StartCycle()
 	SimTimeSec = 0.0;
 	TimeAccumulatorSec = 0.0;
 
+	// 다른 로봇의 태스크 액터와 파일명이 겹치는지 먼저 확정한다 (겹치면 조용히 덮어쓴다).
+	ResolveCsvFileName();
+
 	CsvRows.Reset();
 	if (bEnableCsvLogging)
 	{
@@ -555,6 +641,20 @@ void APickPlaceTaskActor::StartCycle()
 			TEXT("target_x_cm,target_y_cm,target_z_cm,box_held"));
 	}
 
+	// dispatcher 모드: 박스도 슬롯도 dispatcher가 소유한다. 여기서는 배급을 기다리기만 한다.
+	// (bCycleStarted가 서야 dispatcher가 IsIdle()을 true로 보고 배급을 시작한다.)
+	if (Dispatcher)
+	{
+		bCycleStarted = true;
+		EnterPhase(EPickPlacePhase::Idle);
+
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[APickPlaceTaskActor] dispatcher 모드 — '%s'의 배급을 기다립니다 (우선순위 %d). ")
+			TEXT("박스/슬롯은 dispatcher가 소유합니다."),
+			*Dispatcher->GetName(), RobotPriority);
+		return;
+	}
+
 	const int32 FirstBox = FindNextValidBoxIndex(0);
 	if (FirstBox == INDEX_NONE)
 	{
@@ -567,6 +667,7 @@ void APickPlaceTaskActor::StartCycle()
 	// 팔레트 슬롯 높이는 박스 크기에 의존하므로 박스가 확정된 뒤에 계산한다.
 	BuildPalletSlots(Boxes[FirstBox]->GetHeightCm());
 
+	bCycleStarted = true;
 	CurrentBoxIndex = FirstBox;
 
 	// 첫 IK를 돌리기 전에 실제 도달 가능 구간을 찍는다. 실패하더라도 Aborted 로그의 XY반경을
@@ -662,6 +763,15 @@ void APickPlaceTaskActor::ResetCycle()
 		HeldBox = nullptr;
 	}
 
+	// 배급받은 작업을 반납하지 않으면 그 박스와 슬롯이 영구 점유로 새어, 남은 작업이 배급되지 않는다.
+	// 블랙리스트는 걸지 않는다 — 리셋은 이 로봇이 그 박스에 실패했다는 뜻이 아니다.
+	if (Dispatcher && AssignedTask.IsValid())
+	{
+		Dispatcher->ReturnTask(this, AssignedTask, /*bBlacklist=*/false, TEXT("ResetCycle"));
+	}
+	AssignedTask = FPickPlaceTask();
+	bCycleStarted = false;
+
 	Phase = EPickPlacePhase::Idle;
 	CurrentBoxIndex = INDEX_NONE;
 	PhaseElapsedSec = 0.0;
@@ -676,6 +786,91 @@ void APickPlaceTaskActor::ResetCycle()
 void APickPlaceTaskActor::FlushCsvNow()
 {
 	WriteCsvToDisk();
+}
+
+#pragma endregion
+
+#pragma region APickPlaceTaskActor_DispatcherAPI
+
+bool APickPlaceTaskActor::IsIdle() const
+{
+	// bCycleStarted 없이 판단하면 안 된다: dispatcher는 이 액터보다 먼저 틱하므로 첫 프레임에는
+	// StartCycle이 아직 안 돌았고, 그때 배급하면 뒤이어 실행되는 StartCycle이 Phase를 Idle로
+	// 되돌려 배급이 조용히 증발한다.
+	return bCycleStarted && Phase == EPickPlacePhase::Idle && !AssignedTask.IsValid();
+}
+
+void APickPlaceTaskActor::AssignTask(const FPickPlaceTask& InTask)
+{
+	if (!InTask.IsValid())
+	{
+		return;
+	}
+
+	AssignedTask = InTask;
+	EnterPhase(EPickPlacePhase::ToPickApproach);
+}
+
+bool APickPlaceTaskActor::CanReachGraspPointWorld(const FVector& GraspPointWorld)
+{
+	if (!Robot)
+	{
+		return false;
+	}
+
+	const FVector Local = Robot->GetActorTransform().InverseTransformPosition(GraspPointWorld);
+
+	// SolveForVisualGraspPoint가 내부에서 관절 상태를 스냅샷 → 판정 → 복원한다.
+	// (복원이 없으면 도달성 조회만으로 팔이 튄다 — dispatcher가 사이클 시작 전에 수십 번 부른다.)
+	FRobot6DJointState Solution;
+	double ErrorCm = 0.0;
+
+	// 목표 지점 자체.
+	if (!SolveForVisualGraspPoint(FTransform(GraspRotation.Quaternion(), Local), Solution, ErrorCm))
+	{
+		return false;
+	}
+
+	// **접근 자세도 검사해야 한다.** 사이클은 목표만 가는 게 아니라 ApproachOffsetCm만큼 위에서
+	// 수직 진입/이탈하고(ToPickApproach/ToLift/ToPlaceApproach/ToRetreat), 팔이 위로 뻗을수록
+	// 반경이 줄어 접근 자세가 더 빡빡하다. 이걸 빠뜨리면 배급은 되는데 접근 단계에서 Aborted가 나서
+	// 반납 → 재배급이 반복된다 — 도달성 판정이 사이클보다 낙관적이면 안 된다.
+	return SolveForVisualGraspPoint(
+		FTransform(GraspRotation.Quaternion(), Local + ApproachOffsetCm), Solution, ErrorCm);
+}
+
+APickPlaceBoxActor* APickPlaceTaskActor::GetCurrentBox() const
+{
+	if (Dispatcher)
+	{
+		return AssignedTask.Box;
+	}
+
+	return Boxes.IsValidIndex(CurrentBoxIndex) ? Boxes[CurrentBoxIndex].Get() : nullptr;
+}
+
+FTransform APickPlaceTaskActor::GetCurrentPlacePoseLocal(bool bApproach) const
+{
+	if (!Dispatcher)
+	{
+		return GetPlacePoseLocal(CurrentBoxIndex, bApproach);
+	}
+
+	// dispatcher 모드: 슬롯 풀의 소유자가 dispatcher이므로 월드 좌표를 받아 로봇 공간으로 내린다.
+	FVector SlotWorld;
+	if (!Robot || !Dispatcher->GetDestinationSlotWorld(AssignedTask.DestinationSlotIndex, SlotWorld))
+	{
+		// 슬롯을 못 얻으면 제자리에 머문다 — 임의의 좌표를 지어내면 팔이 엉뚱한 데로 날아간다.
+		return FTransform(GraspRotation.Quaternion(), ComputeToolLocalTransform().GetLocation());
+	}
+
+	FVector Location = Robot->GetActorTransform().InverseTransformPosition(SlotWorld);
+	if (bApproach)
+	{
+		Location += ApproachOffsetCm;
+	}
+
+	return FTransform(GraspRotation.Quaternion(), Location);
 }
 
 void APickPlaceTaskActor::LogRobotSkeletonGeometry()
@@ -785,7 +980,8 @@ void APickPlaceTaskActor::EnterPhase(EPickPlacePhase NewPhase)
 	PhaseElapsedSec = 0.0;
 	PhaseDurationSec = 0.0;
 
-	APickPlaceBoxActor* Box = Boxes.IsValidIndex(CurrentBoxIndex) ? Boxes[CurrentBoxIndex].Get() : nullptr;
+	// 모드에 따라 배급된 박스 또는 자기 배열의 박스를 쓴다 (FSM 본문은 두 모드가 동일하다).
+	APickPlaceBoxActor* Box = GetCurrentBox();
 
 	switch (Phase)
 	{
@@ -884,14 +1080,14 @@ void APickPlaceTaskActor::EnterPhase(EPickPlacePhase NewPhase)
 		break;
 
 	case EPickPlacePhase::ToPlaceApproach:
-		if (!BeginTrajectoryTo(GetPlacePoseLocal(CurrentBoxIndex, /*bApproach=*/true)))
+		if (!BeginTrajectoryTo(GetCurrentPlacePoseLocal(/*bApproach=*/true)))
 		{
 			return;
 		}
 		break;
 
 	case EPickPlacePhase::ToPlace:
-		if (!BeginTrajectoryTo(GetPlacePoseLocal(CurrentBoxIndex, /*bApproach=*/false)))
+		if (!BeginTrajectoryTo(GetCurrentPlacePoseLocal(/*bApproach=*/false)))
 		{
 			return;
 		}
@@ -913,7 +1109,7 @@ void APickPlaceTaskActor::EnterPhase(EPickPlacePhase NewPhase)
 	}
 
 	case EPickPlacePhase::ToRetreat:
-		if (!BeginTrajectoryTo(GetPlacePoseLocal(CurrentBoxIndex, /*bApproach=*/true)))
+		if (!BeginTrajectoryTo(GetCurrentPlacePoseLocal(/*bApproach=*/true)))
 		{
 			return;
 		}
@@ -936,10 +1132,16 @@ void APickPlaceTaskActor::EnterPhase(EPickPlacePhase NewPhase)
 		return;
 	}
 
+	// dispatcher 모드에는 CurrentBoxIndex가 없다(배급된 박스를 직접 들고 있다) — 그대로 찍으면
+	// "박스 -1"이 나와 배급이 실패한 것처럼 보인다. 모드에 맞는 식별자를 쓴다.
 	const FVector TargetLocal = CurrentTargetLocal.GetLocation();
+	const FString BoxLabel = Dispatcher
+		? (Box ? Box->GetName() : TEXT("없음"))
+		: FString::FromInt(CurrentBoxIndex);
+
 	UE_LOG(LogRobotSim, Log,
-		TEXT("[APickPlaceTaskActor] 단계 → %s (박스 %d, 소요 %.2fs, 목표 로봇공간 (%.1f, %.1f, %.1f)cm)"),
-		PhaseToString(Phase), CurrentBoxIndex, PhaseDurationSec, TargetLocal.X, TargetLocal.Y, TargetLocal.Z);
+		TEXT("[APickPlaceTaskActor] 단계 → %s (박스 %s, 소요 %.2fs, 목표 로봇공간 (%.1f, %.1f, %.1f)cm)"),
+		PhaseToString(Phase), *BoxLabel, PhaseDurationSec, TargetLocal.X, TargetLocal.Y, TargetLocal.Z);
 }
 
 void APickPlaceTaskActor::AdvanceToNextPhase()
@@ -956,7 +1158,17 @@ void APickPlaceTaskActor::AdvanceToNextPhase()
 
 	case EPickPlacePhase::ToRetreat:
 	{
-		// 사이클의 유일한 분기: 남은 박스가 있으면 다음 pick으로 돌아가고, 없으면 종료한다.
+		// dispatcher 모드: 작업 하나가 끝났으므로 완료 보고하고 Idle로 돌아가 다음 배급을 기다린다.
+		// 다음 작업을 스스로 고르지 않는 것이 핵심이다 — 그게 "할당"을 dispatcher가 소유한다는 뜻이다.
+		if (Dispatcher)
+		{
+			Dispatcher->CompleteTask(this, AssignedTask);
+			AssignedTask = FPickPlaceTask();
+			EnterPhase(EPickPlacePhase::Idle);
+			break;
+		}
+
+		// standalone: 남은 박스가 있으면 다음 pick으로 돌아가고, 없으면 종료한다.
 		const int32 NextBox = FindNextValidBoxIndex(CurrentBoxIndex + 1);
 		if (NextBox != INDEX_NONE)
 		{
@@ -987,6 +1199,17 @@ void APickPlaceTaskActor::AbortCycle(const FString& Reason)
 	{
 		HeldBox->EndGrasp();
 		HeldBox = nullptr;
+	}
+
+	// dispatcher 모드에서 중단은 **이 로봇의 죽음이 아니라 이 작업의 실패**다. 박스와 슬롯을 함께
+	// 반납하고 블랙리스트에 올린 뒤 Idle로 돌아가면, dispatcher가 다른 박스를 주거나 다른 로봇이
+	// 그 박스를 맡는다. Aborted로 굳히면 로봇 한 대가 통째로 죽어 나머지 작업이 멈춘다.
+	if (Dispatcher)
+	{
+		Dispatcher->ReturnTask(this, AssignedTask, /*bBlacklist=*/true, Reason);
+		AssignedTask = FPickPlaceTask();
+		EnterPhase(EPickPlacePhase::Idle);
+		return;
 	}
 
 	EnterPhase(EPickPlacePhase::Aborted);
@@ -1046,36 +1269,56 @@ bool APickPlaceTaskActor::SolveForVisualGraspPoint(
 	FRobot6DJointState BestState = ActiveState;
 	double BestErrorCm = TNumericLimits<double>::Max();
 
-	for (int32 Iter = 0; Iter < MaxVisualIterations; ++Iter)
+	// IK seed 후보. 현재 자세를 먼저 쓴다 — 해가 현재 구성 근처에 나와야 궤적이 매끄럽다.
+	// 실패하면 **홈 자세**로 재시도한다: DLS는 국소 수렴이라 seed에 민감하고, 작업 영역 가장자리에서는
+	// "방금 있던 자리로 되돌아가는 것"조차 실패한다(실제로 ToPickApproach는 성공한 목표에 대해
+	// 같은 좌표의 ToLift가 43cm로 실패했다 — 차이는 seed뿐이었다).
+	//
+	// dispatcher의 도달성 캐시는 홈 자세를 seed로 계산하므로, 이 재시도가 **캐시와 사이클의 판정을
+	// 일치시킨다.** 없으면 "배급은 됐는데 실행하면 중단"이 계속 나고 블랙리스트만 쌓인다.
+	const FRobot6DJointState SeedCandidates[] = { ActiveState, FRobot6DJointState() };
+
+	for (const FRobot6DJointState& Seed : SeedCandidates)
 	{
-		const FRobotDlsIKResult IKResult =
-			FRobotDlsIK::SolveDlsIK(Robot->GetModel(), ActiveState, MathTargetLocal, Options);
+		// seed마다 목표를 원점에서 다시 시작한다 — 앞 seed가 밀어놓은 보정값을 물려받으면 안 된다.
+		MathTargetLocal = DesiredGraspLocal;
 
-		// 해를 적용해 메시를 그 자세로 동기화한 뒤 시각 파지점을 측정한다.
-		Robot->SetJointAngles(IKResult.Solution);
-		const FVector ActualGraspWorld = Robot->GetVisualGraspPointWorld().GetLocation();
-
-		const FVector ErrorWorld = DesiredGraspWorld - ActualGraspWorld;
-		const double ErrorCm = ErrorWorld.Size();
-
-		if (ErrorCm < BestErrorCm)
+		for (int32 Iter = 0; Iter < MaxVisualIterations; ++Iter)
 		{
-			BestErrorCm = ErrorCm;
-			BestState = IKResult.Solution;
+			const FRobotDlsIKResult IKResult =
+				FRobotDlsIK::SolveDlsIK(Robot->GetModel(), Seed, MathTargetLocal, Options);
+
+			// 해를 적용해 메시를 그 자세로 동기화한 뒤 시각 파지점을 측정한다.
+			Robot->SetJointAngles(IKResult.Solution);
+			const FVector ActualGraspWorld = Robot->GetVisualGraspPointWorld().GetLocation();
+
+			const FVector ErrorWorld = DesiredGraspWorld - ActualGraspWorld;
+			const double ErrorCm = ErrorWorld.Size();
+
+			if (ErrorCm < BestErrorCm)
+			{
+				BestErrorCm = ErrorCm;
+				BestState = IKResult.Solution;
+			}
+
+			if (ErrorCm <= MaxReachErrorCm)
+			{
+				bConverged = true;
+				break;
+			}
+
+			// 수학 목표를 오차 방향으로 **감쇠해서** 민다. 감쇠 없이(α=1) 밀면 발산한다:
+			// 시각 그리퍼는 수학 EE의 약 2배 반경으로 움직이므로 f(X)≈2X이고, 그러면
+			// X ← X + (T − 2X) = T − X 가 되어 두 값 사이를 영원히 진동한다.
+			// α=0.5면 반복 행렬이 (1−2α)=0이 되어 한 번에 수렴한다. VisualSolveDamping 주석 참조.
+			MathTargetLocal.SetLocation(
+				MathTargetLocal.GetLocation() + RobotToWorld.InverseTransformVector(ErrorWorld) * VisualSolveDamping);
 		}
 
-		if (ErrorCm <= MaxReachErrorCm)
+		if (bConverged)
 		{
-			bConverged = true;
-			break;
+			break; // 첫 seed(현재 자세)로 풀렸으면 홈 재시도는 불필요하다
 		}
-
-		// 수학 목표를 오차 방향으로 **감쇠해서** 민다. 감쇠 없이(α=1) 밀면 발산한다:
-		// 시각 그리퍼는 수학 EE의 약 2배 반경으로 움직이므로 f(X)≈2X이고, 그러면
-		// X ← X + (T − 2X) = T − X 가 되어 두 값 사이를 영원히 진동한다.
-		// α=0.5면 반복 행렬이 (1−2α)=0이 되어 한 번에 수렴한다. VisualSolveDamping 주석 참조.
-		MathTargetLocal.SetLocation(
-			MathTargetLocal.GetLocation() + RobotToWorld.InverseTransformVector(ErrorWorld) * VisualSolveDamping);
 	}
 
 	Robot->SetJointAngles(SavedState);
@@ -1292,6 +1535,46 @@ void APickPlaceTaskActor::RecordCsvRow()
 	CsvRows.Add(MoveTemp(Row));
 }
 
+void APickPlaceTaskActor::ResolveCsvFileName()
+{
+	ResolvedCsvFileName = CsvFileName;
+
+	const UWorld* World = GetWorld();
+	if (!bEnableCsvLogging || !World || CsvFileName.IsEmpty())
+	{
+		return;
+	}
+
+	// 같은 파일명을 쓰는 다른 태스크 액터가 있는지 본다. 있으면 서로 덮어써서 한쪽 데이터가
+	// 조용히 사라진다 — 둘 다 SaveStringArrayToFile로 같은 경로에 쓰고 나중에 끝난 쪽이 이긴다.
+	bool bCollides = false;
+	for (TActorIterator<APickPlaceTaskActor> It(World); It; ++It)
+	{
+		const APickPlaceTaskActor* Other = *It;
+		if (Other != this && Other->bEnableCsvLogging && Other->CsvFileName == CsvFileName)
+		{
+			bCollides = true;
+			break;
+		}
+	}
+
+	if (!bCollides)
+	{
+		return;
+	}
+
+	// 충돌 시 **양쪽 모두** 액터 이름을 붙인다. 한쪽만 붙이면 남은 'PickPlace.csv'가 누구 것인지
+	// 알 수 없어 오히려 헷갈린다 — 각자 자기를 기준으로 판단하므로 자연히 양쪽 다 붙는다.
+	const FString Base = FPaths::GetBaseFilename(CsvFileName);
+	const FString Ext = FPaths::GetExtension(CsvFileName, /*bIncludeDot=*/true);
+	ResolvedCsvFileName = FString::Printf(TEXT("%s_%s%s"), *Base, *GetName(), *Ext);
+
+	UE_LOG(LogRobotSim, Warning,
+		TEXT("[APickPlaceTaskActor] CSV 파일명 '%s'을(를) 다른 태스크 액터도 쓰고 있어 서로 덮어쓸 뻔했습니다 — ")
+		TEXT("이 액터는 '%s'로 기록합니다. 로봇마다 CsvFileName을 직접 지정하는 편이 읽기 좋습니다."),
+		*CsvFileName, *ResolvedCsvFileName);
+}
+
 void APickPlaceTaskActor::WriteCsvToDisk()
 {
 	// 헤더 한 줄뿐이면 실제 샘플이 없다는 뜻이므로 빈 파일을 만들지 않는다.
@@ -1300,13 +1583,19 @@ void APickPlaceTaskActor::WriteCsvToDisk()
 		return;
 	}
 
+	// StartCycle이 확정한 이름을 쓴다. EndPlay가 StartCycle 없이 불릴 수도 있으므로 폴백을 둔다.
+	const FString FileName = ResolvedCsvFileName.IsEmpty() ? CsvFileName : ResolvedCsvFileName;
 	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("RobotSim"));
-	const FString FilePath = FPaths::Combine(Directory, CsvFileName);
+	const FString FilePath = FPaths::Combine(Directory, FileName);
 
 	// SaveStringArrayToFile은 디렉터리를 만들어 주지 않는다 — 첫 실행에서 조용히 실패하지 않도록 먼저 만든다.
 	IFileManager::Get().MakeDirectory(*Directory, /*Tree=*/true);
 
-	if (FFileHelper::SaveStringArrayToFile(CsvRows, *FilePath))
+	// UTF-8(BOM 포함) 강제. 기본값(AutoDetect)은 비ASCII 문자가 하나라도 있으면 **UTF-16**으로 쓰는데,
+	// 그러면 pandas/awk 같은 일반 도구가 못 읽어 제출물로 부적합해진다. phase 이름이 지금은 전부
+	// ASCII라 우연히 괜찮았을 뿐, 한글이 한 글자만 섞여도 조용히 UTF-16이 된다.
+	// (BOM이 있어야 Excel이 UTF-8로 인식한다 — 없으면 한글이 깨진다.)
+	if (FFileHelper::SaveStringArrayToFile(CsvRows, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8))
 	{
 		UE_LOG(LogRobotSim, Log, TEXT("[APickPlaceTaskActor] CSV %d행 기록: %s"), CsvRows.Num() - 1, *FilePath);
 	}
