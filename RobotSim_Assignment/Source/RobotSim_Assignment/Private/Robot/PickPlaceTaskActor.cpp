@@ -14,6 +14,7 @@
 #include "Misc/Paths.h"
 #include "Robot/PickPlaceDispatcher.h"
 #include "Robot/RobotDlsIK.h"
+#include "Robot/RobotDynamicsRNEA.h"
 #include "Robot/RobotSimLog.h"
 #include "Robot/Serial6DoFModel.h"
 #include "Robot/Serial6DoFRobotActor.h"
@@ -45,6 +46,29 @@ namespace
 
 	/** 적재 시 박스 바닥을 지지면에서 살짝 띄우는 여유 (cm). 놓는 순간 지지면과 겹쳐 튀는 것을 막는다. */
 	constexpr double PlaceClearanceCm = 0.5;
+
+	/**
+	 * 프레임타임 HUD 표시의 EMA 계수. 원시 DeltaSeconds는 프레임마다 크게 튀어 숫자를 읽을 수 없다.
+	 * 평활의 대가로 스파이크가 과소평가되므로, 이 값은 **표시용이지 프로파일링용이 아니다** —
+	 * 정확한 프레임 분석은 `stat unit`을 쓸 것.
+	 */
+	constexpr double FrameTimeSmoothingAlpha = 0.1;
+
+	/**
+	 * UI 텔레메트리용 RNEA 옵션.
+	 *
+	 * 마찰을 켜는 이유: qd가 유한차분으로 실제 값이 들어오므로 마찰 항(점성 + 쿨롱)이 물리적 의미를
+	 * 갖는다. 로터 관성을 끄는 이유: 그 항은 qdd에만 곱해지는데 여기선 qdd=0이라 아무 효과가 없다 —
+	 * 켜면 "고려했다"는 거짓 정밀도만 생긴다.
+	 */
+	FRobotRNEAOptions MakeTelemetryRNEAOptions()
+	{
+		FRobotRNEAOptions Options;
+		Options.bEnableGravity = true;
+		Options.bIncludeFriction = true;
+		Options.bIncludeRotorInertia = false;
+		return Options;
+	}
 }
 
 #pragma region APickPlaceBoxActor
@@ -222,6 +246,9 @@ void APickPlaceTaskActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	// HUD 프레임타임. 원시값은 진동이 심해 읽을 수 없으므로 EMA로 평활한다 (표시용, 프로파일링용 아님).
+	LastFrameTimeMs = FMath::Lerp(LastFrameTimeMs, static_cast<double>(DeltaSeconds) * 1000.0, FrameTimeSmoothingAlpha);
+
 	// 자동 시작은 첫 Tick으로 미뤄져 있다 (BeginPlay 순서 문제 — BeginPlay의 주석 참조).
 	// 이 시점엔 로봇 BeginPlay가 끝나 VisualGraspPoint가 본에 붙어 있다.
 	if (bPendingAutoStart)
@@ -249,7 +276,13 @@ void APickPlaceTaskActor::Tick(float DeltaSeconds)
 
 	// Idle(dispatcher 대기)/Done/Aborted에서는 FSM을 전진시키지 않지만 SetJointAngles는 계속해야 한다.
 	// 멈추면 로봇 Tick의 JointAnglesDeg 되쓰기가 다시 이겨서 팔이 홈 자세로 튕겨 돌아간다.
-	if (Phase != EPickPlacePhase::Idle && Phase != EPickPlacePhase::Done && Phase != EPickPlacePhase::Aborted)
+	//
+	// bPaused도 같은 부류다 — 전진만 멈추고 관절 소유권은 놓지 않는다 (SetPaused 주석 참조).
+	const bool bAdvancing =
+		!bPaused &&
+		Phase != EPickPlacePhase::Idle && Phase != EPickPlacePhase::Done && Phase != EPickPlacePhase::Aborted;
+
+	if (bAdvancing)
 	{
 		// 고정 타임스텝 적분: 프레임 시간을 누적해 FixedTimeStepSec 단위로만 FSM을 전진시킨다.
 		// 프레임레이트가 흔들려도 궤적 형상과 CSV 샘플 간격이 동일하게 나온다.
@@ -273,6 +306,15 @@ void APickPlaceTaskActor::Tick(float DeltaSeconds)
 			// 상한에 걸렸다 = 프레임이 심하게 밀렸다. 남은 빚을 버려 나선을 끊는다.
 			TimeAccumulatorSec = 0.0;
 		}
+	}
+	else
+	{
+		// 정지 중이어도 팔은 중력을 버티고 있다. 게이지를 0으로 두면 화면이 거짓말을 한다.
+		UpdateHoldingTorqueCache();
+
+		// **누적기를 전진시키지 않는다.** Pause 중 DeltaSeconds를 계속 더하면 재개 순간 밀린 빚이
+		// 한꺼번에 터져 MaxFixedStepsPerFrame 클램프가 걸리고, 그건 곧 결정론 경고다.
+		TimeAccumulatorSec = 0.0;
 	}
 
 	// 관절 상태를 로봇에 반영한다. 로봇의 되쓰기는 이 시점에 이미 끝났으므로(tick prerequisite)
@@ -623,6 +665,13 @@ void APickPlaceTaskActor::StartCycle()
 	SimTimeSec = 0.0;
 	TimeAccumulatorSec = 0.0;
 
+	// 텔레메트리 캐시도 처음부터다. 남겨두면 이전 사이클의 토크/오차가 UI에 잠깐 유령처럼 남는다.
+	// bPaused는 건드리지 않는다 — 일시정지는 사용자의 UI 의도이지 사이클 상태가 아니다.
+	LastJointVelocityRadPerSec = FRobot6DJointVelocity();
+	LastJointTorqueNm = FRobot6DJointTorque();
+	LastReachErrorCm = 0.0;
+	CompletedBoxCount = 0;
+
 	// 다른 로봇의 태스크 액터와 파일명이 겹치는지 먼저 확정한다 (겹치면 조용히 덮어쓴다).
 	ResolveCsvFileName();
 
@@ -634,11 +683,15 @@ void APickPlaceTaskActor::StartCycle()
 		//
 		// (한때 흡착판/박스 월드 좌표도 기록했는데, 그건 로봇 컴포넌트를 읽는 값이라 로봇 Tick이
 		//  JointAnglesDeg로 되쓴 홈 자세를 찍었다. 화면은 멀쩡한데 CSV만 틀리는 함정이라 걷어냈다.)
+		//
+		// tau 컬럼은 **끝에 붙인다** — 중간에 끼우면 기존 컬럼 인덱스가 밀려서 이미 만든 분석
+		// 스크립트/차트가 조용히 다른 열을 읽는다.
 		CsvRows.Add(TEXT("time_s,phase,box_index,")
 			TEXT("q0_deg,q1_deg,q2_deg,q3_deg,q4_deg,q5_deg,")
 			TEXT("qd0_degps,qd1_degps,qd2_degps,qd3_degps,qd4_degps,qd5_degps,")
 			TEXT("ee_x_cm,ee_y_cm,ee_z_cm,ee_roll_deg,ee_pitch_deg,ee_yaw_deg,")
-			TEXT("target_x_cm,target_y_cm,target_z_cm,box_held"));
+			TEXT("target_x_cm,target_y_cm,target_z_cm,box_held,")
+			TEXT("tau0_nm,tau1_nm,tau2_nm,tau3_nm,tau4_nm,tau5_nm"));
 	}
 
 	// dispatcher 모드: 박스도 슬롯도 dispatcher가 소유한다. 여기서는 배급을 기다리기만 한다.
@@ -779,11 +832,185 @@ void APickPlaceTaskActor::ResetCycle()
 	SimTimeSec = 0.0;
 	TimeAccumulatorSec = 0.0;
 
+	LastJointVelocityRadPerSec = FRobot6DJointVelocity();
+	LastJointTorqueNm = FRobot6DJointTorque();
+	LastReachErrorCm = 0.0;
+	CompletedBoxCount = 0;
+
 	UE_LOG(LogRobotSim, Log,
 		TEXT("[APickPlaceTaskActor] 사이클을 Idle로 리셋했습니다 — 관절 소유권을 로봇에 반환하므로 팔이 JointAnglesDeg 자세로 돌아갑니다."));
 }
 
 void APickPlaceTaskActor::FlushCsvNow()
+{
+	WriteCsvToDisk();
+}
+
+#pragma endregion
+
+#pragma region APickPlaceTaskActor_UIBinding
+
+//~ 여기 있는 getter는 전부 **캐시/기존 상태만 읽는다**. RNEA도 IK도 FK 재계산도 없다.
+//~ BlueprintPure는 바인딩 수 × 프레임만큼 호출되므로 하나라도 계산을 하면 프레임이 무너진다.
+//~ 모두 Robot이 null이거나 PIE 시작 전이어도 안전한 기본값을 반환한다.
+
+FText APickPlaceTaskActor::GetRobotDisplayText() const
+{
+	// 로봇이 없으면 이 액터 이름 — 빈 문자열을 주면 패널이 익명이 되어 어느 로봇인지 알 수 없다.
+	return FText::FromString(Robot ? Robot->GetActorNameOrLabel() : GetActorNameOrLabel());
+}
+
+FText APickPlaceTaskActor::GetPhaseDisplayText() const
+{
+	// 로그/CSV와 **같은 문자열**을 쓴다. UMETA DisplayName을 따로 두면 화면과 로그가 갈라져
+	// "화면엔 Grasp인데 CSV엔 뭐라고 찍혔나"를 매번 번역해야 한다.
+	return FText::FromString(PhaseToString(Phase));
+}
+
+float APickPlaceTaskActor::GetPhaseProgress() const
+{
+	if (PhaseDurationSec <= 0.0)
+	{
+		return 0.0f;
+	}
+
+	return static_cast<float>(FMath::Clamp(PhaseElapsedSec / PhaseDurationSec, 0.0, 1.0));
+}
+
+TArray<float> APickPlaceTaskActor::GetJointAnglesDeg() const
+{
+	TArray<float> Result;
+	Result.Reserve(FSerial6DoFModel::NumJoints);
+
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		Result.Add(static_cast<float>(FMath::RadiansToDegrees(ActiveState.Q[i])));
+	}
+
+	return Result;
+}
+
+TArray<float> APickPlaceTaskActor::GetJointVelocityDegPerSec() const
+{
+	TArray<float> Result;
+	Result.Reserve(FSerial6DoFModel::NumJoints);
+
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		Result.Add(static_cast<float>(FMath::RadiansToDegrees(LastJointVelocityRadPerSec.Qd[i])));
+	}
+
+	return Result;
+}
+
+TArray<float> APickPlaceTaskActor::GetJointTorqueNm() const
+{
+	TArray<float> Result;
+	Result.Reserve(FSerial6DoFModel::NumJoints);
+
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		Result.Add(static_cast<float>(LastJointTorqueNm.TauNm[i]));
+	}
+
+	return Result;
+}
+
+TArray<float> APickPlaceTaskActor::GetJointTorqueRatio() const
+{
+	TArray<float> Result;
+	Result.Reserve(FSerial6DoFModel::NumJoints);
+
+	if (!Robot)
+	{
+		Result.AddZeroed(FSerial6DoFModel::NumJoints);
+		return Result;
+	}
+
+	const FSerial6DoFModel& Model = Robot->GetModel();
+
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		const double MaxTorqueNm = Model.JointLimits[i].MaxTorqueNm;
+
+		// 한계가 0 이하면 0을 반환한다 — 나누면 inf/NaN이 게이지로 새어 위젯이 깨진다.
+		// (B-02가 경고했듯 기본값 100 N·m는 J1의 실측 −303 N·m에 한참 못 미친다. 그 경우 이 비율은
+		//  1.0에 붙박이는데, 그건 게이지 버그가 아니라 **MaxTorqueNm가 실제로 부족하다는 신호**다.)
+		Result.Add(MaxTorqueNm > 0.0
+			? static_cast<float>(FMath::Clamp(FMath::Abs(LastJointTorqueNm.TauNm[i]) / MaxTorqueNm, 0.0, 1.0))
+			: 0.0f);
+	}
+
+	return Result;
+}
+
+FVector APickPlaceTaskActor::GetToolLocationWorld() const
+{
+	if (!Robot)
+	{
+		return FVector::ZeroVector;
+	}
+
+	return LocalToWorld(ComputeToolLocalTransform()).GetLocation();
+}
+
+float APickPlaceTaskActor::GetLastReachErrorCm() const
+{
+	return static_cast<float>(LastReachErrorCm);
+}
+
+int32 APickPlaceTaskActor::GetCompletedBoxCount() const
+{
+	return CompletedBoxCount;
+}
+
+float APickPlaceTaskActor::GetFrameTimeMs() const
+{
+	return static_cast<float>(LastFrameTimeMs);
+}
+
+bool APickPlaceTaskActor::IsCycleRunning() const
+{
+	return bCycleStarted
+		&& Phase != EPickPlacePhase::Idle
+		&& Phase != EPickPlacePhase::Done
+		&& Phase != EPickPlacePhase::Aborted;
+}
+
+bool APickPlaceTaskActor::IsPaused() const
+{
+	return bPaused;
+}
+
+void APickPlaceTaskActor::SetPaused(bool bInPaused)
+{
+	bPaused = bInPaused;
+}
+
+float APickPlaceTaskActor::GetVelocityScale() const
+{
+	return static_cast<float>(VelocityScale);
+}
+
+void APickPlaceTaskActor::SetVelocityScale(float NewVelocityScale)
+{
+	// UPROPERTY meta의 ClampMin/ClampMax와 **같은 범위**로 막는다. 에디터 경로와 UI 경로가 다른 범위를
+	// 허용하면 슬라이더로만 만들 수 있는 상태가 생긴다. 0이면 궤적 소요시간이 무한대가 된다.
+	VelocityScale = FMath::Clamp(static_cast<double>(NewVelocityScale), 0.01, 1.0);
+}
+
+float APickPlaceTaskActor::GetDwellSec() const
+{
+	return static_cast<float>(DwellSec);
+}
+
+void APickPlaceTaskActor::SetDwellSec(float NewDwellSec)
+{
+	// 상한 5초는 UI 슬라이더의 실용 범위다 (그 이상은 데모가 멈춘 것처럼 보인다).
+	DwellSec = FMath::Clamp(static_cast<double>(NewDwellSec), 0.0, 5.0);
+}
+
+void APickPlaceTaskActor::SaveMotionCsvNow()
 {
 	WriteCsvToDisk();
 }
@@ -965,6 +1192,10 @@ void APickPlaceTaskActor::StepFixed(double DeltaSec)
 	{
 		EvaluateTrajectory();
 	}
+
+	// 반드시 EvaluateTrajectory **뒤**여야 한다 — 앞에서 부르면 ActiveState == PreviousState라
+	// 각속도가 항상 0이 되고 마찰 항까지 죽는다. RecordCsvRow보다 앞이어야 CSV가 이 스텝의 토크를 쓴다.
+	UpdateTelemetryCache();
 
 	RecordCsvRow();
 
@@ -1158,6 +1389,9 @@ void APickPlaceTaskActor::AdvanceToNextPhase()
 
 	case EPickPlacePhase::ToRetreat:
 	{
+		// 여기가 "박스 하나를 끝낸" 유일한 지점이다 (두 모드 공통). Aborted는 세지 않는다 — 실패다.
+		++CompletedBoxCount;
+
 		// dispatcher 모드: 작업 하나가 끝났으므로 완료 보고하고 Idle로 돌아가 다음 배급을 기다린다.
 		// 다음 작업을 스스로 고르지 않는 것이 핵심이다 — 그게 "할당"을 dispatcher가 소유한다는 뜻이다.
 		if (Dispatcher)
@@ -1353,6 +1587,9 @@ bool APickPlaceTaskActor::BeginTrajectoryTo(const FTransform& TargetLocal)
 	FRobot6DJointState Solution;
 	const bool bVisualConverged = SolveForVisualGraspPoint(TargetLocal, Solution, VisualErrorCm);
 
+	// 성공/실패 양쪽 다 남긴다. 실패했을 때의 값이 오히려 UI에서 더 중요하다 — 중단 사유가 화면에 뜬다.
+	LastReachErrorCm = VisualErrorCm;
+
 	// 도달 판정은 **시각 파지점 오차** 기준이다 — 사용자가 눈으로 보는 것도, 박스가 실제로 붙는 것도
 	// 그 점이기 때문이다. 수학 EE 오차가 0이어도 그리퍼가 박스에서 1m 떨어져 있으면 실패다.
 	if (!bVisualConverged)
@@ -1489,11 +1726,54 @@ FTransform APickPlaceTaskActor::GetPlacePoseLocal(int32 BoxIndex, bool bApproach
 
 #pragma endregion
 
+#pragma region APickPlaceTaskActor_Telemetry
+
+void APickPlaceTaskActor::UpdateTelemetryCache()
+{
+	if (!Robot)
+	{
+		LastJointVelocityRadPerSec = FRobot6DJointVelocity();
+		LastJointTorqueNm = FRobot6DJointTorque();
+		return;
+	}
+
+	// 각속도: 고정 스텝 유한차분. 스텝 간격이 항상 FixedTimeStepSec라 프레임레이트에 오염되지 않는다.
+	// (StepFixed가 EvaluateTrajectory 전에 PreviousState를 잡아 두므로 두 상태는 정확히 한 스텝 차다.)
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		LastJointVelocityRadPerSec.Qd[i] = (ActiveState.Q[i] - PreviousState.Q[i]) / FixedTimeStepSec;
+	}
+
+	// qdd = 0 — **의도적이다.** 현 구동은 위치 지령 + 관절공간 보간이라 관절 가속도가 동역학 적분의
+	// 결과가 아니다. 궤적의 2차 미분을 넣어도 "실제 구동 토크"라는 물리적 의미가 없으므로,
+	// 정직하게 준정적(quasi-static) 추정으로 남긴다. 중력·마찰은 살아 있고 관성·코리올리는 빠진다.
+	const FRobot6DJointAcceleration ZeroAccel;
+
+	LastJointTorqueNm = SolveInverseDynamicsRNEA(
+		Robot->GetModel(), ActiveState, LastJointVelocityRadPerSec, ZeroAccel, MakeTelemetryRNEAOptions());
+}
+
+void APickPlaceTaskActor::UpdateHoldingTorqueCache()
+{
+	if (!Robot)
+	{
+		LastJointVelocityRadPerSec = FRobot6DJointVelocity();
+		LastJointTorqueNm = FRobot6DJointTorque();
+		return;
+	}
+
+	// 정지 상태이므로 각속도는 0이다. 마찰(qd에 비례)도 자연히 사라져 순수 중력 보상 토크만 남는다.
+	LastJointVelocityRadPerSec = FRobot6DJointVelocity();
+	LastJointTorqueNm = ComputeGravityTorque(Robot->GetModel(), ActiveState, MakeTelemetryRNEAOptions());
+}
+
+#pragma endregion
+
 #pragma region APickPlaceTaskActor_Logging
 
 void APickPlaceTaskActor::RecordCsvRow()
 {
-	if (!bEnableCsvLogging || !Robot)
+	if (!bEnableCsvLogging || !Robot || bPaused)
 	{
 		return;
 	}
@@ -1518,10 +1798,10 @@ void APickPlaceTaskActor::RecordCsvRow()
 
 	// 각속도는 고정 타임스텝 유한차분으로 구한다. 스텝 간격이 항상 FixedTimeStepSec로 일정하므로
 	// 프레임레이트에 오염되지 않은 물리값이 된다 — 가변 DeltaSeconds로는 얻을 수 없는 성질이다.
+	// UpdateTelemetryCache가 이미 계산해 뒀다 — 여기서 다시 계산하면 UI 게이지와 CSV가 갈라질 수 있다.
 	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
 	{
-		const double VelDegPerSec = FMath::RadiansToDegrees(ActiveState.Q[i] - PreviousState.Q[i]) / FixedTimeStepSec;
-		Row += FString::Printf(TEXT(",%.5f"), VelDegPerSec);
+		Row += FString::Printf(TEXT(",%.5f"), FMath::RadiansToDegrees(LastJointVelocityRadPerSec.Qd[i]));
 	}
 
 	Row += FString::Printf(TEXT(",%.4f,%.4f,%.4f,%.4f,%.4f,%.4f"),
@@ -1531,6 +1811,14 @@ void APickPlaceTaskActor::RecordCsvRow()
 	const FVector TargetLocation = TargetWorld.GetLocation();
 	Row += FString::Printf(TEXT(",%.4f,%.4f,%.4f,%d"),
 		TargetLocation.X, TargetLocation.Y, TargetLocation.Z, HeldBox ? 1 : 0);
+
+	// B-02 RNEA 토크 (N·m). **캐시를 읽을 뿐 여기서 RNEA를 돌리지 않는다** — UI 게이지와 같은 값이어야
+	// "화면에서 본 토크"와 "CSV의 토크"가 같은 스텝의 같은 수라는 것이 보장된다.
+	// qdd=0 준정적 근사다 (LastJointTorqueNm 주석 참조).
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		Row += FString::Printf(TEXT(",%.5f"), LastJointTorqueNm.TauNm[i]);
+	}
 
 	CsvRows.Add(MoveTemp(Row));
 }
@@ -1604,8 +1892,11 @@ void APickPlaceTaskActor::WriteCsvToDisk()
 		UE_LOG(LogRobotSim, Warning, TEXT("[APickPlaceTaskActor] CSV 기록 실패: %s (경로/권한 확인)"), *FilePath);
 	}
 
-	// 헤더만 남겨 재기록 시 중복 append를 막는다 (FlushCsvNow를 여러 번 눌러도 안전).
-	CsvRows.SetNum(1);
+	// **버퍼를 비우지 않는다.** SaveStringArrayToFile은 append가 아니라 **덮어쓰기**이므로, 여기서
+	// 헤더만 남기면 다음 기록 때 파일이 "마지막 flush 이후의 행"으로 덮여 그 앞이 통째로 사라진다.
+	// (D-01의 Save CSV 버튼처럼 사이클 도중 flush하면 즉시 터진다. 사이클 하나가 120Hz×수십 초 =
+	//  수천 행이라 전량 보관해도 메모리는 무시할 만하다.)
+	// 매번 전체를 쓰므로 몇 번을 눌러도 파일은 항상 처음부터 끝까지 온전하다.
 }
 
 const TCHAR* APickPlaceTaskActor::PhaseToString(EPickPlacePhase InPhase)

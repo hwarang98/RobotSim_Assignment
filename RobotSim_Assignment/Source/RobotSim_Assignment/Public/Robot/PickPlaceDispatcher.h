@@ -93,6 +93,69 @@ public:
 
 	#pragma endregion
 
+	#pragma region UIBinding
+
+	//~ UMG 바인딩 표면 (STEP D-01). 멀티로봇 대시보드가 이 액터를 진입점으로 쓴다.
+	//~
+	//~ **선택 상태(어느 로봇을 보고 있는가)는 여기 두지 않는다.** UI 정책이 시뮬레이션 액터로 새면
+	//~ dispatcher가 배급자이면서 동시에 UI 상태 저장소가 되어 책임이 섞인다. 여기서는 목록만 주고,
+	//~ 패널 생성과 선택은 Widget Blueprint가 한다.
+
+	/**
+	 * 등록된 태스크 액터 목록. **정렬 순서 = 실제 배급 우선순위**다.
+	 *
+	 * 순서를 보존하는 것이 중요하다: UI 패널 순서와 배급 우선순위가 다르면 "위에 있는 로봇이 왜
+	 * 나중에 받지?"라는 혼란이 생긴다. 정렬은 InitializeWorkPool이 한 번 하고 이후 고정된다
+	 * (SortTaskActorsDeterministically 참조).
+	 */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	TArray<APickPlaceTaskActor*> GetTaskActors() const;
+
+	/** 아직 아무에게도 배급되지 않은 박스 수. 0인데 로봇이 놀고 있으면 슬롯이 병목이라는 뜻이다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	int32 GetUnassignedBoxCount() const;
+
+	/** 비어 있는 도착지 슬롯 수. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	int32 GetFreeSlotCount() const;
+
+	/**
+	 * 현재 배급 현황 (여러 줄). 로봇 2대가 **동시에 서로 다른 작업을 맡고 있다**는 증거를 화면에 띄우는 값.
+	 * 예: "Robot_A -> Box3 (slot 1)\nRobot_B -> Box4 (slot 2)"
+	 */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	FString GetAssignmentSummary() const;
+
+	/** 등록된 로봇 전부 사이클 시작 (배급 대기 상태로 진입). */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void StartAllRobots();
+
+	/**
+	 * 전체 일시정지/재개. **dispatcher 자신의 배급도 함께 멈춘다** —
+	 * 안 그러면 멈춰 있는 로봇에게 계속 작업이 배급되어 재개 순간 이상한 상태로 시작한다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void PauseAllRobots(bool bInPaused);
+
+	/**
+	 * **전체 재초기화**: 로봇을 되돌리고 박스를 파괴한 뒤 작업 풀을 처음부터 다시 만든다.
+	 *
+	 * 로봇만 리셋하면 이미 도착지로 옮긴 박스가 그대로 남아(BoxTaken은 완료 후에도 true다) 두 번째
+	 * 실행이 반쪽짜리가 된다. 데모의 Reset 버튼이 기대받는 동작은 "처음 상태로"이므로 박스를 다시
+	 * 스폰한다.
+	 *
+	 * **비싸다**: 도달성 캐시를 재계산하므로(DLS 최대 288회) 누르는 순간 한 번 스톨한다.
+	 * PIE 시작 시의 스톨과 같은 비용이고, 사용자가 명시적으로 누른 시점이라 녹화 사고는 아니다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void ResetAllRobots();
+
+	/** 모든 로봇의 CSV + Dispatch.csv를 지금 즉시 기록한다 (사이클 종료 전에 확인하고 싶을 때). */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void FlushAllCsvNow();
+
+	#pragma endregion
+
 protected:
 	#pragma region Setup
 
@@ -220,6 +283,9 @@ private:
 
 	/** 정지/완료 보고를 이미 했는지 (매 스텝 로그 도배 방지). 새 배급이 일어나면 다시 열린다. */
 	bool bStallReported = false;
+
+	/** UI 일시정지 (PauseAllRobots). 배급 자체를 멈춘다 — 멈춘 로봇에게 배급하면 안 되기 때문이다. */
+	bool bPaused = false;
 
 	/** dispatcher 고정 스텝 누적기. */
 	double TimeAccumulatorSec = 0.0;

@@ -79,6 +79,15 @@ void APickPlaceDispatcher::Tick(float DeltaSeconds)
 
 	DrawDebugLayout();
 
+	// 일시정지 중에는 배급을 멈춘다 — 멈춰 있는 로봇에게 작업을 주면 재개 순간 이미 배급이 끝난
+	// 이상한 상태에서 시작한다. 태스크 액터와 같은 규칙으로 **누적기 자체를 전진시키지 않는다**:
+	// 누적만 하고 소진을 막으면 재개 순간 밀린 빚이 터져 배급이 한 프레임에 몰린다.
+	if (bPaused)
+	{
+		TimeAccumulatorSec = 0.0;
+		return;
+	}
+
 	// 배급도 고정 스텝으로 전진시킨다. 태스크 액터와 같은 시간 기준을 써야 Dispatch.csv의
 	// sim_time_sec과 PickPlace CSV의 time_s를 나란히 놓고 볼 수 있다.
 	TimeAccumulatorSec += DeltaSeconds;
@@ -98,6 +107,182 @@ void APickPlaceDispatcher::Tick(float DeltaSeconds)
 		TimeAccumulatorSec = 0.0;
 	}
 }
+
+#pragma region UIBinding
+
+TArray<APickPlaceTaskActor*> APickPlaceDispatcher::GetTaskActors() const
+{
+	TArray<APickPlaceTaskActor*> Result;
+	Result.Reserve(RegisteredTasks.Num());
+
+	// **정렬 순서를 그대로 보존한다** — 이 순서가 곧 배급 우선순위이고, UI 패널 순서가 그와 다르면
+	// "위에 있는 로봇이 왜 나중에 받지?"라는 혼란이 생긴다.
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Result.Add(Task);
+		}
+	}
+
+	return Result;
+}
+
+int32 APickPlaceDispatcher::GetUnassignedBoxCount() const
+{
+	int32 Count = 0;
+	for (int32 b = 0; b < Boxes.Num(); ++b)
+	{
+		if (Boxes[b] && BoxTaken.IsValidIndex(b) && !BoxTaken[b])
+		{
+			++Count;
+		}
+	}
+
+	return Count;
+}
+
+int32 APickPlaceDispatcher::GetFreeSlotCount() const
+{
+	int32 Count = 0;
+	for (const bool bTaken : SlotTaken)
+	{
+		if (!bTaken)
+		{
+			++Count;
+		}
+	}
+
+	return Count;
+}
+
+FString APickPlaceDispatcher::GetAssignmentSummary() const
+{
+	TArray<FString> Lines;
+	Lines.Reserve(RegisteredTasks.Num());
+
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (!Task)
+		{
+			continue;
+		}
+
+		const FString RobotName = Task->GetRobot() ? Task->GetRobot()->GetActorNameOrLabel() : Task->GetActorNameOrLabel();
+		const FPickPlaceTask& Assigned = Task->GetAssignedTask();
+
+		Lines.Add(Assigned.IsValid()
+			? FString::Printf(TEXT("%s -> Box%d (slot %d)"),
+				*RobotName, IndexOfBox(Assigned.Box), Assigned.DestinationSlotIndex)
+			: FString::Printf(TEXT("%s -> idle"), *RobotName));
+	}
+
+	return FString::Join(Lines, TEXT("\n"));
+}
+
+void APickPlaceDispatcher::StartAllRobots()
+{
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Task->StartCycle();
+		}
+	}
+}
+
+void APickPlaceDispatcher::PauseAllRobots(bool bInPaused)
+{
+	bPaused = bInPaused;
+
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Task->SetPaused(bInPaused);
+		}
+	}
+
+	UE_LOG(LogRobotSim, Log, TEXT("[PickPlaceDispatcher] 전체 %s (로봇 %d대 + 배급)"),
+		bInPaused ? TEXT("일시정지") : TEXT("재개"), RegisteredTasks.Num());
+}
+
+void APickPlaceDispatcher::ResetAllRobots()
+{
+	// (0) 먼저 디스크에 남긴다. 아래 StartCycle이 CSV 버퍼를 비우므로, 안 하면 리셋 직전까지의
+	// 샘플이 메모리에서 **조용히** 증발한다 — 로그도 에러도 없이.
+	// (다음 사이클이 같은 파일명으로 다시 기록하면 이 내용은 새 사이클 데이터로 덮인다. 즉 CSV는
+	//  항상 "가장 최근 사이클"을 뜻한다. 리셋 후 그냥 멈춘 경우에 직전 사이클이 남는 것이 이득이다.)
+	FlushAllCsvNow();
+
+	// 순서가 중요하다. (1) 먼저 로봇을 되돌린다 — ResetCycle이 배급을 반납하고 잡고 있던 박스를
+	// 놓는다. 박스를 파괴한 **뒤에** 하면 태스크가 이미 죽은 박스를 만지게 된다.
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Task->ResetCycle();
+		}
+	}
+
+	// (2) 박스를 파괴한다. 로봇만 리셋하면 BoxTaken이 완료 후에도 true라 이미 옮긴 박스가 도착지에
+	// 남고 두 번째 실행이 반쪽짜리가 된다 — Reset 버튼이 기대받는 동작은 "처음 상태로"다.
+	for (const TObjectPtr<APickPlaceBoxActor>& Box : Boxes)
+	{
+		if (Box)
+		{
+			Box->Destroy();
+		}
+	}
+	Boxes.Reset();
+
+	// (3) 작업 풀 상태를 통째로 비운다. 하나라도 남기면 재초기화된 인덱스와 어긋나 조용히 오배급된다.
+	BoxTaken.Reset();
+	SlotTaken.Reset();
+	SlotActiveTask.Reset();
+	BoxReachCache.Reset();
+	SlotReachCache.Reset();
+	Blacklist.Reset();
+	DestinationSlotsWorld.Reset();
+
+	bInitialized = false;
+	bStallReported = false;
+	SimTimeSec = 0.0;
+	TimeAccumulatorSec = 0.0;
+
+	// (4) 다음 Tick에 기존 InitializeWorkPool이 재실행된다 — 박스 재스폰 + 슬롯 + 도달성 캐시.
+	// 초기화 경로를 하나로 두어야 PIE 시작과 Reset이 조용히 갈라지지 않는다.
+	bPendingInit = true;
+
+	// (5) 로봇을 다시 시작시켜 배급 대기 상태로 만든다. ResetCycle이 bCycleStarted를 false로 두므로
+	// 이게 없으면 IsIdle()이 영원히 false여서 아무에게도 배급되지 않는다 (조용한 정지).
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Task->StartCycle();
+		}
+	}
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[PickPlaceDispatcher] 전체 재초기화 — 박스를 다시 스폰하고 도달성 캐시를 재계산합니다 ")
+		TEXT("(이 순간 한 번 스톨합니다)."));
+}
+
+void APickPlaceDispatcher::FlushAllCsvNow()
+{
+	for (const TObjectPtr<APickPlaceTaskActor>& Task : RegisteredTasks)
+	{
+		if (Task)
+		{
+			Task->FlushCsvNow();
+		}
+	}
+
+	WriteDispatchCsvToDisk();
+}
+
+#pragma endregion
 
 #pragma region Initialization
 
@@ -792,8 +977,10 @@ void APickPlaceDispatcher::WriteDispatchCsvToDisk()
 		UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceDispatcher] 배급 CSV 기록 실패: %s"), *FilePath);
 	}
 
-	// 헤더만 남겨 재기록 시 중복 append를 막는다.
-	DispatchCsvRows.SetNum(1);
+	// **버퍼를 비우지 않는다** — SaveStringArrayToFile은 덮어쓰기다. 헤더만 남기면 다음 기록 때
+	// 파일이 "마지막 flush 이후의 이벤트"로 덮여 그 앞의 배급 이력이 사라진다. 이 파일은 "할당이
+	// 실제로 일어났다"는 증거이므로 앞부분이 사라지면 용도 자체가 무너진다.
+	// (PickPlaceTaskActor::WriteCsvToDisk와 같은 규약이다.)
 }
 
 #pragma endregion

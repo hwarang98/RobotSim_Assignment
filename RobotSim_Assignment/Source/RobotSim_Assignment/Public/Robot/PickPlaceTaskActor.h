@@ -366,6 +366,111 @@ public:
 
 	#pragma endregion
 
+	#pragma region UIBinding
+
+	//~ UMG 바인딩 표면 (STEP D-01). Widget Blueprint가 이 액터를 ViewModel처럼 읽는다.
+	//~
+	//~ **모든 BlueprintPure getter는 캐시/기존 상태만 반환한다 — RNEA도 IK도 절대 돌리지 않는다.**
+	//~ BlueprintPure는 바인딩된 위젯 수 × 프레임만큼 호출되므로(같은 프레임에 여러 번), getter가
+	//~ 계산을 하면 프레임이 무너진다. 토크는 StepFixed가 한 번 계산해 캐시한 값을 읽을 뿐이다.
+	//~
+	//~ **선택 상태(어느 로봇을 보고 있는가)는 여기 없다.** UI 정책이 시뮬레이션 액터로 새면 안 된다 —
+	//~ dispatcher가 GetTaskActors()로 목록만 주고 패널 생성/선택은 위젯이 한다.
+	//~
+	//~ double이 아니라 float/TArray를 반환하는 이유: Blueprint는 double과 고정 배열을 다루기 불편하다.
+	//~ 단위 변환(rad→deg)과 정밀도 축소는 **UI 경계에서만** 일어나며 내부 상태는 그대로 double이다.
+
+	/** 로봇 표시 이름 (로봇이 없으면 이 액터 이름). 멀티로봇 패널의 제목. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	FText GetRobotDisplayText() const;
+
+	/** 현재 FSM 단계 이름. 로그/CSV와 **같은 문자열**을 쓴다 — 화면과 로그가 갈라지면 대조가 안 된다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	FText GetPhaseDisplayText() const;
+
+	/** 현재 단계의 진행률 0~1 (ProgressBar용). 대기 시간이 0인 단계는 0을 반환한다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	float GetPhaseProgress() const;
+
+	/** 관절각 6개 (도). 이 액터가 소유한 ActiveState 기준 — 로봇 컴포넌트를 읽지 않는다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	TArray<float> GetJointAnglesDeg() const;
+
+	/** 관절 각속도 6개 (도/초). 고정 스텝 유한차분 캐시. CSV의 qd 컬럼과 **같은 값**이다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	TArray<float> GetJointVelocityDegPerSec() const;
+
+	/**
+	 * 관절 토크 6개 (N·m). B-02 RNEA의 결과이며 CSV의 tau 컬럼과 **같은 캐시**를 읽는다.
+	 * **qdd=0 준정적 추정이다** — 중력/마찰 항만 살아 있고 관성·코리올리 항은 빠져 있다.
+	 * 이 토크는 표시용이며 실제 구동에 관여하지 않는다 (구동은 여전히 SetJointAngles 기구학이다).
+	 */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	TArray<float> GetJointTorqueNm() const;
+
+	/** 관절별 토크 사용률 |τ_i| / MaxTorqueNm_i, 0~1 clamp (게이지 바용). 한계가 0 이하면 0. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	TArray<float> GetJointTorqueRatio() const;
+
+	/** 현재 툴 팁 위치 (월드, cm). 수학 FK 결과이며 시각 그리퍼 위치가 아니다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	FVector GetToolLocationWorld() const;
+
+	/** 마지막 IK가 남긴 시각 파지점 오차 (cm). MaxReachErrorCm를 넘으면 사이클이 중단된 것이다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	float GetLastReachErrorCm() const;
+
+	/** 이 로봇이 완료한 박스 수 (사이클 시작 이후 누적). */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	int32 GetCompletedBoxCount() const;
+
+	/** 프레임 시간 (ms). **EMA 평활값이다** — 원시값은 진동이 심해 HUD에서 숫자를 읽을 수 없다. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	float GetFrameTimeMs() const;
+
+	/** 사이클이 실제로 전진 중인가 (Idle/Done/Aborted가 아니고 시작됐는가). */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	bool IsCycleRunning() const;
+
+	/** 일시정지 상태인가. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	bool IsPaused() const;
+
+	/**
+	 * 일시정지 설정. FSM 고정 스텝 전진과 CSV 행 기록을 멈춘다.
+	 *
+	 * 관절 상태 밀어넣기(SetJointAngles)와 박스 추종은 **멈추지 않는다** — 멈추면 로봇 Tick의
+	 * JointAnglesDeg 되쓰기가 이겨서 팔이 홈 자세로 튕긴다. 잡고 있던 박스가 현재 자세에 그대로
+	 * 붙어 있는 것도 이 때문이다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void SetPaused(bool bInPaused);
+
+	/** 속도 프로파일 튜닝: 관절 속도 한계 대비 사용 비율 (0.01~1). */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|Tuning")
+	float GetVelocityScale() const;
+
+	/** 속도 프로파일 튜닝. 다음 **단계 진입**부터 반영된다 — 진행 중인 궤적의 소요시간은 이미 확정됐다. */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace|Tuning")
+	void SetVelocityScale(float NewVelocityScale);
+
+	/** Grasp/Release 대기 시간 (초). */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|Tuning")
+	float GetDwellSec() const;
+
+	/** Grasp/Release 대기 시간 설정 (0~5초로 clamp). */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace|Tuning")
+	void SetDwellSec(float NewDwellSec);
+
+	/**
+	 * 모션 저장: 누적된 CSV 샘플을 지금 즉시 파일로 기록한다 (FlushCsvNow와 동일 동작).
+	 * PDF의 "모션 저장" 슬롯이다. **로드는 없다** — trajectory 로드 시스템이 없으므로 만들지 않았다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void SaveMotionCsvNow();
+
+	#pragma endregion
+
 protected:
 	#pragma region Setup
 
@@ -717,6 +822,39 @@ private:
 
 	#pragma endregion
 
+	#pragma region Telemetry
+
+	//~ UI getter와 CSV가 **공유하는 캐시**다 (STEP D-01). 고정 스텝마다 한 번 갱신되며, 읽는 쪽은
+	//~ 절대 재계산하지 않는다. 두 소비자가 각자 계산하면 같은 프레임에 다른 토크를 보게 되고,
+	//~ 그러면 "화면의 게이지가 CSV와 다르다"는 조용한 불일치가 생긴다.
+
+	/** 직전 고정 스텝의 관절 각속도 (rad/s). 유한차분 (ActiveState − PreviousState) / FixedTimeStepSec. */
+	FRobot6DJointVelocity LastJointVelocityRadPerSec;
+
+	/**
+	 * 직전 고정 스텝의 관절 토크 (N·m) — B-02 RNEA 결과.
+	 *
+	 * **qdd=0 준정적 추정이다.** 현 구동은 위치 지령 + 관절공간 보간이라 관절 가속도가 동역학
+	 * 적분의 결과가 아니다. 궤적의 2차 미분을 넣어도 "실제 구동 토크"라는 물리적 의미가 없으므로
+	 * 넣지 않는다. 살아 있는 항은 **중력과 마찰**이고, 관성 M(q)q̈와 코리올리 C(q,q̇)q̇는 빠진다.
+	 * 온전한 토크는 B-06 computed torque 제어가 들어와야 나온다.
+	 */
+	FRobot6DJointTorque LastJointTorqueNm;
+
+	/** 프레임 시간 (ms), EMA 평활값. 원시값은 진동이 심해 HUD에서 읽을 수 없다. */
+	double LastFrameTimeMs = 0.0;
+
+	/** 마지막 IK가 남긴 시각 파지점 오차 (cm). BeginTrajectoryTo가 채운다. */
+	double LastReachErrorCm = 0.0;
+
+	/** 사이클 시작 이후 완료한 박스 수. */
+	int32 CompletedBoxCount = 0;
+
+	/** 일시정지 (UI). FSM 전진과 CSV 기록만 멈추고 관절 밀어넣기는 계속한다 — SetPaused 주석 참조. */
+	bool bPaused = false;
+
+	#pragma endregion
+
 	#pragma region CsvBuffer
 
 	/** CSV 행 버퍼. 사이클 종료(Done/Aborted) 또는 EndPlay/FlushCsvNow 시 파일로 기록한다. */
@@ -841,6 +979,24 @@ private:
 
 	/** 로봇 공간 → 월드 변환 (로봇이 없으면 입력을 그대로 반환). */
 	FTransform LocalToWorld(const FTransform& Local) const;
+
+	/**
+	 * 구동 중 텔레메트리 캐시를 갱신한다 (각속도 유한차분 + RNEA 토크). 고정 스텝마다 **한 번**.
+	 *
+	 * 호출 위치가 중요하다: StepFixed가 맨 위에서 PreviousState = ActiveState를 하고 EvaluateTrajectory가
+	 * ActiveState를 갱신하므로, **EvaluateTrajectory 뒤 · RecordCsvRow 앞**에서만 불러야 한다.
+	 * 그보다 앞에서 부르면 두 상태가 같아 각속도가 항상 0이 되고, 마찰 항까지 조용히 죽는다.
+	 */
+	void UpdateTelemetryCache();
+
+	/**
+	 * 정지 상태(Idle/Done/Aborted/Pause)의 **자세 유지 중력 토크**를 캐시한다. Tick당 한 번.
+	 *
+	 * 왜 0으로 두지 않는가: dispatcher 모드의 Idle은 "다음 배급 대기 중 자세 유지"이고 Pause도
+	 * 마찬가지다 — 팔은 실제로 중력을 버티고 있다. 게이지를 0으로 그리면 화면이 거짓말을 한다.
+	 * qd=qdd=0이므로 마찰/관성 항이 자연히 사라져 순수 중력 보상 토크 g(q)만 남는다.
+	 */
+	void UpdateHoldingTorqueCache();
 
 	/** 현재 스텝의 물리값을 CSV 행 하나로 버퍼에 추가한다. */
 	void RecordCsvRow();
