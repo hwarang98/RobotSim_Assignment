@@ -364,6 +364,50 @@ public:
 	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
 	void LogRobotSkeletonGeometry();
 
+	//~ 모션 CSV 재생 (D-02) — RecordCsvRow/WriteCsvToDisk의 **역방향**. 저장한 관절 궤적을
+	//~ 고정 타임스텝으로 되재생해 "결정론적 재현"을 눈으로 증명한다.
+
+	/**
+	 * CSV를 파싱해 ReplayFrames에 관절 궤적을 채운다 (재생은 하지 않는다).
+	 *
+	 * 로드와 재생을 분리한 이유: 같은 파일을 여러 번 재생할 때 매번 파싱하지 않기 위해서다.
+	 * 컬럼은 **0행 헤더를 파싱해 이름(q0_deg~q5_deg)으로 찾는다** — 고정 인덱스는 컬럼 순서가
+	 * 한 번만 바뀌어도 조용히 틀린 열을 읽는다. 기록↔재생 대칭의 계약은 컬럼 이름이지 위치가 아니다.
+	 */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
+	void LoadMotionCsv();
+
+	/**
+	 * <Project>/Saved/RobotSim/ 폴더의 *.csv 파일명 목록을 반환한다 (UI 드롭다운용).
+	 *
+	 * 파일 시스템을 훑으므로 BlueprintPure가 아니라 BlueprintCallable이다 — 매 프레임 폴링하면 안 되고,
+	 * 드롭다운을 열 때(또는 사이클 종료 후 갱신)만 부른다.
+	 */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
+	TArray<FString> GetAvailableMotionCsvFiles() const;
+
+	/**
+	 * 재생할 파일명을 지정한다 (드롭다운 OnSelectionChanged → 여기 → PlayReplay 순서).
+	 * ReplayMotionFileName 프로퍼티를 BP에서 쓰기 위한 setter다. 다음 LoadMotionCsv/PlayReplay부터 적용된다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PickPlace")
+	void SetReplayMotionFileName(const FString& InFileName);
+
+	/** 로드한 궤적을 처음부터 재생한다. ReplayFrames가 비어 있으면 LoadMotionCsv를 한 번 자동 호출한다. */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
+	void PlayReplay();
+
+	/** 재생을 중단하고 Idle로 돌아간다. */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
+	void StopReplay();
+
+	/**
+	 * 누적 CSV 파일을 삭제해 처음부터 다시 쌓게 한다 (bAccumulateMotionAcrossRuns용).
+	 * 로드해둔 재생 프레임과 과거 누적 행도 함께 비운다.
+	 */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "PickPlace")
+	void ClearMotionCsv();
+
 	#pragma endregion
 
 	#pragma region UIBinding
@@ -427,6 +471,25 @@ public:
 	/** 프레임 시간 (ms). **EMA 평활값이다** — 원시값은 진동이 심해 HUD에서 숫자를 읽을 수 없다. */
 	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
 	float GetFrameTimeMs() const;
+
+	/**
+	 * 지금 CSV에 궤적을 기록하는 중인가 (UI의 🔴 REC 표시등용). IsReplaying과 대칭이다.
+	 *
+	 * "기록 중"의 정의: 로깅이 켜져 있고(bEnableCsvLogging), 사이클이 시작됐으며(bCycleStarted),
+	 * 재생 중이 아니다. 재생은 관절을 되재생만 하지 새 샘플을 쌓지 않으므로 기록이 아니다.
+	 * 별도의 record 버튼은 없다 — StartCycle이 곧 기록 시작이고, 저장은 사이클 종료 시 자동이다.
+	 * 이 getter는 그 "자동으로 켜진 기록 상태"를 화면에 드러내기 위한 것이다.
+	 */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	bool IsRecording() const;
+
+	/** 지금 모션 CSV를 재생 중인가 (D-01의 IsReplaying/GetReplayProgress 표면과 대칭). */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	bool IsReplaying() const;
+
+	/** 재생 진행률 0~1 (ProgressBar용). 재생 중이 아니면 0. */
+	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
+	float GetReplayProgress() const;
 
 	/** 사이클이 실제로 전진 중인가 (Idle/Done/Aborted가 아니고 시작됐는가). */
 	UFUNCTION(BlueprintPure, Category = "PickPlace|UI")
@@ -742,6 +805,34 @@ protected:
 
 	#pragma endregion
 
+	#pragma region Replay
+
+	/**
+	 * 재생할 모션 CSV 파일명 (경로는 <Project>/Saved/RobotSim/<이름>).
+	 * **비어 있으면 이 액터의 CsvFileName을 쓴다** — 방금 자기가 기록한 궤적을 그대로 재생하는 것이
+	 * 가장 흔한 경우이므로 기본값을 그쪽에 맞춘다. 멀티로봇에서 파일명이 충돌하면 StartCycle이
+	 * 액터 이름을 붙이므로, 그 경우엔 실제 저장된 파일명(예: PickPlace_A.csv)을 여기에 지정한다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Replay")
+	FString ReplayMotionFileName;
+
+	/**
+	 * 켜면 새 사이클을 기존 CSV **뒤에 이어붙인다** (여러 실행을 한 파일에 누적). 끄면(기본) 매 실행이
+	 * 파일을 덮어써 항상 "가장 최근 사이클"만 남는다.
+	 *
+	 * @details
+	 * 켜두면 PIE를 여러 번 돌린 궤적이 한 파일에 시간순으로 쌓이고, PlayReplay가 그 전체를 이어서
+	 * 재생한다 — "여러 사이클 누적 재생". 누적을 처음부터 다시 시작하려면 ClearMotionCsv를 누른다.
+	 *
+	 * 구현은 디스크 append가 아니라 **기존 파일을 읽어 앞에 붙여 다시 쓰기**다: append는 UTF-8 BOM이
+	 * 파일 중간에 박혀 파서를 깨뜨린다. 기존 파일의 헤더가 현재 헤더와 다르면(컬럼 스키마 변경) 섞지
+	 * 않고 경고 후 새로 시작한다 — 스키마가 다른 행이 섞이면 재생/분석이 조용히 틀어지기 때문이다.
+	 */
+	UPROPERTY(EditAnywhere, Category = "PickPlace|Replay")
+	bool bAccumulateMotionAcrossRuns = false;
+
+	#pragma endregion
+
 private:
 	#pragma region FSMState
 
@@ -866,12 +957,45 @@ private:
 	 */
 	FString ResolvedCsvFileName;
 
+	/**
+	 * bAccumulateMotionAcrossRuns가 켜졌을 때, 이번 사이클 시작 시점에 기존 파일에서 읽어둔 과거 데이터 행
+	 * (헤더 제외). WriteCsvToDisk가 [헤더] + 이 행들 + [이번 사이클 행] 순서로 써서 누적을 유지한다.
+	 */
+	TArray<FString> AccumulatedPriorRows;
+
+	#pragma endregion
+
+	#pragma region ReplayState
+
+	/**
+	 * 재생 중인가. **FSM 단계가 아니라 그 위에 얹는 별도 모드다** — EPickPlacePhase는 건드리지 않는다.
+	 * true면 Tick이 FSM 전진을 통째로 건너뛰고 재생 스테퍼만 돌리며, IsIdle()이 false가 되어
+	 * dispatcher가 이 로봇에 배급하지 않는다.
+	 */
+	bool bReplayActive = false;
+
+	/** LoadMotionCsv가 파싱한 관절 궤적. 각 원소가 한 고정 스텝의 6관절 각도(radian). */
+	TArray<FRobot6DJointState> ReplayFrames;
+
+	/** 현재 재생 프레임 인덱스. */
+	int32 ReplayFrameIndex = 0;
+
+	/** 재생 프레임 전진용 시간 누적기 (FSM의 TimeAccumulatorSec와 독립 — 두 모드가 공존하지 않으므로 분리한다). */
+	double ReplayTimeAccumulatorSec = 0.0;
+
 	#pragma endregion
 
 	#pragma region Internal
 
 	/** FSM을 고정 타임스텝 하나만큼 전진시킨다. Tick이 누적기를 소진하며 반복 호출한다. */
 	void StepFixed(double DeltaSec);
+
+	/**
+	 * 재생을 고정 타임스텝으로 전진시킨다 (Tick이 bReplayActive일 때 호출). 기록이 CSV 한 행 = 한
+	 * 고정 스텝으로 저장했으므로, 재생도 FixedTimeStepSec마다 프레임 하나를 ActiveState에 되넣는다.
+	 * 마지막 프레임을 지나면 bReplayActive=false로 끄고 Idle로 복귀한다.
+	 */
+	void StepReplay(double DeltaSec);
 
 	/**
 	 * 새 단계로 진입한다. 궤적 단계면 목표 자세를 정해 IK를 풀고 궤적을 준비하며,
@@ -1009,8 +1133,17 @@ private:
 	 */
 	void ResolveCsvFileName();
 
-	/** CSV 버퍼를 <Project>/Saved/RobotSim/<ResolvedCsvFileName>에 기록하고 버퍼를 비운다. */
+	/** 이 액터가 기록/재생에 쓰는 CSV의 전체 경로 (<Project>/Saved/RobotSim/<확정 파일명>). */
+	FString GetMotionCsvPath() const;
+
+	/** CSV 버퍼를 <Project>/Saved/RobotSim/<ResolvedCsvFileName>에 기록한다 (누적 모드면 과거 행을 앞에 붙인다). */
 	void WriteCsvToDisk();
+
+	/**
+	 * 누적 모드에서 사이클 시작 시 기존 파일의 과거 데이터 행을 AccumulatedPriorRows에 읽어둔다.
+	 * 파일이 없으면 빈 채로 둔다. **기존 헤더가 현재 헤더와 다르면** 섞지 않고 경고 후 새로 시작한다.
+	 */
+	void LoadPriorRowsForAccumulation();
 
 	/** 단계 이름을 로그/CSV용 문자열로 반환한다. */
 	static const TCHAR* PhaseToString(EPickPlacePhase InPhase);

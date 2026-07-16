@@ -266,6 +266,35 @@ void APickPlaceTaskActor::Tick(float DeltaSeconds)
 				PhaseToString(Phase), CurrentBoxIndex + 1, Boxes.Num(), SimTimeSec));
 	}
 
+	// 모션 재생 (D-02) — FSM 위에 얹는 별도 모드다. 재생 중에는 FSM을 전진시키지 않고 저장된 관절
+	// 궤적만 고정 스텝으로 되재생한 뒤, 아래 공통 경로(SetJointAngles)로 로봇에 민다. 여기서 return하지
+	// 않고 SetJointAngles까지 흘러가야 로봇 Tick의 홈 자세 되쓰기를 이긴다.
+	if (bReplayActive)
+	{
+		ReplayTimeAccumulatorSec += DeltaSeconds;
+
+		int32 StepsThisFrame = 0;
+		while (bReplayActive && ReplayTimeAccumulatorSec >= FixedTimeStepSec && StepsThisFrame < MaxFixedStepsPerFrame)
+		{
+			StepReplay(FixedTimeStepSec);
+			ReplayTimeAccumulatorSec -= FixedTimeStepSec;
+			++StepsThisFrame;
+		}
+
+		if (StepsThisFrame >= MaxFixedStepsPerFrame)
+		{
+			ReplayTimeAccumulatorSec = 0.0;
+		}
+
+		// 재생 중에도 관절은 로봇에 밀어야 한다. 박스는 재생 대상이 아니므로 UpdateHeldBoxTransform은
+		// 부르지 않는다 (재생 중 HeldBox는 항상 nullptr다).
+		if (Robot)
+		{
+			Robot->SetJointAngles(ActiveState);
+		}
+		return;
+	}
+
 	// standalone의 Idle은 "이 액터가 관절을 소유하지 않는다"는 뜻이므로 로봇에게 돌려준다
 	// (STEP A 동작 그대로). 반면 **dispatcher 모드의 Idle은 "다음 배급 대기"** 라 자세를 유지해야 한다 —
 	// 놓으면 작업 사이마다 팔이 홈 자세로 튕겨 데모가 경련한다.
@@ -694,6 +723,14 @@ void APickPlaceTaskActor::StartCycle()
 			TEXT("tau0_nm,tau1_nm,tau2_nm,tau3_nm,tau4_nm,tau5_nm"));
 	}
 
+	// 누적 모드면 기존 파일의 과거 행을 읽어둔다 (헤더 확정 뒤 — 헤더 일치 검사에 CsvRows[0]이 필요하다).
+	// 끄면 AccumulatedPriorRows는 비어 있어 기존 동작(덮어쓰기)과 동일하다.
+	AccumulatedPriorRows.Reset();
+	if (bEnableCsvLogging && bAccumulateMotionAcrossRuns)
+	{
+		LoadPriorRowsForAccumulation();
+	}
+
 	// dispatcher 모드: 박스도 슬롯도 dispatcher가 소유한다. 여기서는 배급을 기다리기만 한다.
 	// (bCycleStarted가 서야 dispatcher가 IsIdle()을 true로 보고 배급을 시작한다.)
 	if (Dispatcher)
@@ -825,6 +862,10 @@ void APickPlaceTaskActor::ResetCycle()
 	AssignedTask = FPickPlaceTask();
 	bCycleStarted = false;
 
+	// 재생 중 리셋하면 재생도 멈춘다 (파싱한 프레임은 남겨 다시 PlayReplay로 재생할 수 있게 한다).
+	bReplayActive = false;
+	ReplayTimeAccumulatorSec = 0.0;
+
 	Phase = EPickPlacePhase::Idle;
 	CurrentBoxIndex = INDEX_NONE;
 	PhaseElapsedSec = 0.0;
@@ -845,6 +886,261 @@ void APickPlaceTaskActor::FlushCsvNow()
 {
 	WriteCsvToDisk();
 }
+
+#pragma region Replay
+
+void APickPlaceTaskActor::LoadMotionCsv()
+{
+	ReplayFrames.Reset();
+
+	// 재생 파일명: 지정이 없으면 이 액터가 기록하는 CsvFileName을 쓴다 (방금 자기 궤적을 재생하는 흔한 경우).
+	const FString FileName = ReplayMotionFileName.IsEmpty() ? CsvFileName : ReplayMotionFileName;
+	if (FileName.IsEmpty())
+	{
+		UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceTask] 재생 파일명이 비어 있습니다 (ReplayMotionFileName/CsvFileName 확인)."));
+		return;
+	}
+
+	const FString FilePath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("RobotSim"), FileName);
+
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath) || Lines.Num() < 2)
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[PickPlaceTask] 모션 CSV를 읽지 못했습니다: %s (파일 없음 또는 데이터 행 0개). 먼저 사이클을 한 번 돌려 CSV를 생성하세요."),
+			*FilePath);
+		return;
+	}
+
+	// 컬럼은 **이름으로 찾는다** — 고정 인덱스는 컬럼 순서가 한 번만 바뀌어도 조용히 틀린 열을 읽는다.
+	// (기록부는 tau를 끝에 붙인다는 규약이 있어 중간 삽입 여지가 있다.) 기록↔재생 대칭의 계약은 이름이다.
+	TArray<FString> Header;
+	Lines[0].ParseIntoArray(Header, TEXT(","), /*InCullEmpty=*/false);
+
+	int32 QColumn[FSerial6DoFModel::NumJoints];
+	for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+	{
+		// 헤더에 BOM/공백이 섞일 수 있으므로 trim 후 정확히 일치하는 이름을 찾는다.
+		const FString Want = FString::Printf(TEXT("q%d_deg"), i);
+		QColumn[i] = INDEX_NONE;
+		for (int32 c = 0; c < Header.Num(); ++c)
+		{
+			if (Header[c].TrimStartAndEnd() == Want)
+			{
+				QColumn[i] = c;
+				break;
+			}
+		}
+
+		if (QColumn[i] == INDEX_NONE)
+		{
+			UE_LOG(LogRobotSim, Warning,
+				TEXT("[PickPlaceTask] 헤더에서 컬럼 '%s'을(를) 찾지 못했습니다 — 이 파일은 재생할 수 없습니다 (헤더 불일치). 파일: %s"),
+				*Want, *FilePath);
+			ReplayFrames.Reset();
+			return;
+		}
+	}
+
+	// 데이터 행 파싱. 숫자 파싱 실패 행은 스킵하되 경고는 한 번만 낸다 (스팸 금지).
+	const int32 MaxColumnNeeded = FMath::Max<int32>({ QColumn[0], QColumn[1], QColumn[2], QColumn[3], QColumn[4], QColumn[5] });
+	bool bWarnedBadRow = false;
+
+	for (int32 r = 1; r < Lines.Num(); ++r)
+	{
+		TArray<FString> Cols;
+		Lines[r].ParseIntoArray(Cols, TEXT(","), /*InCullEmpty=*/false);
+		if (Cols.Num() <= MaxColumnNeeded)
+		{
+			if (!bWarnedBadRow)
+			{
+				UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceTask] 컬럼 수가 부족한 행을 건너뜁니다 (행 %d 등). 이후 유사 행은 조용히 스킵합니다."), r);
+				bWarnedBadRow = true;
+			}
+			continue;
+		}
+
+		FRobot6DJointState Frame;
+		bool bRowOk = true;
+		for (int32 i = 0; i < FSerial6DoFModel::NumJoints; ++i)
+		{
+			const FString Cell = Cols[QColumn[i]].TrimStartAndEnd();
+			if (!Cell.IsNumeric())
+			{
+				bRowOk = false;
+				break;
+			}
+			// **degree → radian 역변환.** 기록은 RadiansToDegrees로 저장하므로 정확히 역으로 되돌린다.
+			// 빠뜨리면 팔이 57배 꺾인다.
+			Frame.Q[i] = FMath::DegreesToRadians(FCString::Atod(*Cell));
+		}
+
+		if (!bRowOk)
+		{
+			if (!bWarnedBadRow)
+			{
+				UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceTask] 숫자로 파싱되지 않는 행을 건너뜁니다 (행 %d 등). 이후 유사 행은 조용히 스킵합니다."), r);
+				bWarnedBadRow = true;
+			}
+			continue;
+		}
+
+		ReplayFrames.Add(Frame);
+	}
+
+	if (ReplayFrames.Num() == 0)
+	{
+		UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceTask] 파싱된 재생 프레임이 0개입니다: %s"), *FilePath);
+		return;
+	}
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[PickPlaceTask] 모션 CSV 로드 완료 — %d 프레임 (%s). 고정 스텝 %.4fs로 재생하면 약 %.2fs 길이."),
+		ReplayFrames.Num(), *FileName, FixedTimeStepSec, ReplayFrames.Num() * FixedTimeStepSec);
+}
+
+TArray<FString> APickPlaceTaskActor::GetAvailableMotionCsvFiles() const
+{
+	TArray<FString> Files;
+
+	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("RobotSim"));
+	IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("*.csv")), /*Files=*/true, /*Directories=*/false);
+
+	// FindFiles는 파일명만 반환한다(경로 없음). 그대로 드롭다운에 쓰고, LoadMotionCsv가 폴더를 붙인다.
+	Files.Sort();
+	return Files;
+}
+
+void APickPlaceTaskActor::SetReplayMotionFileName(const FString& InFileName)
+{
+	if (ReplayMotionFileName == InFileName)
+	{
+		return;
+	}
+
+	ReplayMotionFileName = InFileName;
+
+	// 파일이 바뀌었으면 로드해 둔 프레임을 버린다 — 안 그러면 다음 PlayReplay가 (비어 있지 않으므로)
+	// 자동 로드를 건너뛰고 **이전 파일**을 재생한다. 조용히 틀린 파일을 트는 함정이다.
+	ReplayFrames.Reset();
+
+	UE_LOG(LogRobotSim, Log, TEXT("[PickPlaceTask] 재생 파일 지정 — '%s' (다음 PlayReplay에서 로드)"), *InFileName);
+}
+
+void APickPlaceTaskActor::PlayReplay()
+{
+	if (!Robot)
+	{
+		UE_LOG(LogRobotSim, Warning, TEXT("[PickPlaceTask] Robot이 없어 재생할 수 없습니다."));
+		return;
+	}
+
+	// 편의: 아직 로드 안 했으면 한 번 자동 로드한다 (로드/재생 분리는 유지하되 버튼 한 번으로 되게).
+	if (ReplayFrames.Num() == 0)
+	{
+		LoadMotionCsv();
+	}
+	if (ReplayFrames.Num() == 0)
+	{
+		return; // LoadMotionCsv가 이미 이유를 로그로 남겼다
+	}
+
+	// 진행 중이던 사이클/파지를 정리한다 — 재생과 FSM이 같은 관절을 두고 다투면 안 된다.
+	if (HeldBox)
+	{
+		HeldBox->EndGrasp();
+		HeldBox = nullptr;
+	}
+	if (Dispatcher && AssignedTask.IsValid())
+	{
+		Dispatcher->ReturnTask(this, AssignedTask, /*bBlacklist=*/false, TEXT("PlayReplay"));
+	}
+	AssignedTask = FPickPlaceTask();
+
+	Phase = EPickPlacePhase::Idle;   // 재생은 FSM 단계가 아니라 그 위에 얹는 모드다
+	bReplayActive = true;
+	ReplayFrameIndex = 0;
+	ReplayTimeAccumulatorSec = 0.0;
+
+	// 첫 프레임을 즉시 반영해 재생 시작 순간의 튐을 없앤다.
+	ActiveState = ReplayFrames[0];
+
+	UE_LOG(LogRobotSim, Log, TEXT("[PickPlaceTask] 재생 시작 — %d 프레임."), ReplayFrames.Num());
+}
+
+void APickPlaceTaskActor::StopReplay()
+{
+	if (!bReplayActive)
+	{
+		return;
+	}
+
+	bReplayActive = false;
+	Phase = EPickPlacePhase::Idle;
+
+	UE_LOG(LogRobotSim, Log, TEXT("[PickPlaceTask] 재생 중단 (%d/%d 프레임)."), ReplayFrameIndex, ReplayFrames.Num());
+}
+
+void APickPlaceTaskActor::ClearMotionCsv()
+{
+	const FString FilePath = GetMotionCsvPath();
+
+	const bool bDeleted = IFileManager::Get().Delete(*FilePath, /*RequireExists=*/false, /*EvenReadOnly=*/false, /*Quiet=*/true);
+
+	AccumulatedPriorRows.Reset();
+	ReplayFrames.Reset();
+	ReplayFrameIndex = 0;
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[PickPlaceTask] 모션 CSV %s: %s"), bDeleted ? TEXT("삭제") : TEXT("삭제 대상 없음"), *FilePath);
+}
+
+void APickPlaceTaskActor::StepReplay(double /*DeltaSec*/)
+{
+	if (ReplayFrames.Num() == 0)
+	{
+		bReplayActive = false;
+		return;
+	}
+
+	// CSV 한 행 = 고정 스텝 하나. 프레임을 되넣기만 한다 — 각속도/토크는 재생 대상이 아니다
+	// (그 값들은 저장된 궤적의 파생일 뿐이고, 재생의 계약은 "관절각을 그대로 되돌린다"이다).
+	ActiveState = ReplayFrames[ReplayFrameIndex];
+	++ReplayFrameIndex;
+
+	if (ReplayFrameIndex >= ReplayFrames.Num())
+	{
+		bReplayActive = false;
+		Phase = EPickPlacePhase::Idle;
+		UE_LOG(LogRobotSim, Log, TEXT("[PickPlaceTask] 재생 완료 — %d 프레임 재현."), ReplayFrames.Num());
+	}
+}
+
+bool APickPlaceTaskActor::IsRecording() const
+{
+	// **실제로 샘플이 쌓이는 순간**만 true다 — IsReplaying이 재생 프레임 전진 중에만 true인 것과 대칭.
+	// RecordCsvRow는 StepFixed에서만 불리고, StepFixed는 FSM이 전진할 때만 돈다. 그 조건을 그대로 반영한다:
+	// 로깅 켜짐 + 로봇 있음 + 재생 아님 + 일시정지 아님 + 궤적을 전진시키는 단계(Idle/Done/Aborted 아님).
+	// 그래서 Done에 도달하거나 배급 대기(Idle)로 들어가면 REC 표시등이 꺼진다.
+	return bEnableCsvLogging && Robot && !bReplayActive && !bPaused
+		&& Phase != EPickPlacePhase::Idle && Phase != EPickPlacePhase::Done && Phase != EPickPlacePhase::Aborted;
+}
+
+bool APickPlaceTaskActor::IsReplaying() const
+{
+	return bReplayActive;
+}
+
+float APickPlaceTaskActor::GetReplayProgress() const
+{
+	if (!bReplayActive || ReplayFrames.Num() == 0)
+	{
+		return 0.0f;
+	}
+	return static_cast<float>(ReplayFrameIndex) / static_cast<float>(ReplayFrames.Num());
+}
+
+#pragma endregion
 
 #pragma endregion
 
@@ -1024,7 +1320,10 @@ bool APickPlaceTaskActor::IsIdle() const
 	// bCycleStarted 없이 판단하면 안 된다: dispatcher는 이 액터보다 먼저 틱하므로 첫 프레임에는
 	// StartCycle이 아직 안 돌았고, 그때 배급하면 뒤이어 실행되는 StartCycle이 Phase를 Idle로
 	// 되돌려 배급이 조용히 증발한다.
-	return bCycleStarted && Phase == EPickPlacePhase::Idle && !AssignedTask.IsValid();
+	//
+	// 재생 중에는 Idle이 아니다 — Phase는 Idle이어도 팔이 저장된 궤적을 재생 중이므로, dispatcher가
+	// 배급하면 두 모드가 같은 관절을 두고 다툰다.
+	return bCycleStarted && !bReplayActive && Phase == EPickPlacePhase::Idle && !AssignedTask.IsValid();
 }
 
 void APickPlaceTaskActor::AssignTask(const FPickPlaceTask& InTask)
@@ -1863,40 +2162,93 @@ void APickPlaceTaskActor::ResolveCsvFileName()
 		*CsvFileName, *ResolvedCsvFileName);
 }
 
+FString APickPlaceTaskActor::GetMotionCsvPath() const
+{
+	// StartCycle이 확정한 이름을 쓴다. EndPlay가 StartCycle 없이 불릴 수도 있으므로 폴백을 둔다.
+	const FString FileName = ResolvedCsvFileName.IsEmpty() ? CsvFileName : ResolvedCsvFileName;
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("RobotSim"), FileName);
+}
+
+void APickPlaceTaskActor::LoadPriorRowsForAccumulation()
+{
+	AccumulatedPriorRows.Reset();
+
+	const FString FilePath = GetMotionCsvPath();
+
+	TArray<FString> Existing;
+	if (!FFileHelper::LoadFileToStringArray(Existing, *FilePath) || Existing.Num() < 2)
+	{
+		return; // 파일 없음 또는 데이터 없음 — 새로 시작 (조용히, 첫 누적이므로 정상)
+	}
+
+	// **헤더가 현재와 다르면 섞지 않는다.** 컬럼 스키마(예: tau 추가로 25→31)가 바뀐 파일을 이어붙이면
+	// 재생/분석이 조용히 틀어진다 — D-02의 "컬럼 이름 계약"과 같은 이유다.
+	const FString CurrentHeader = (CsvRows.Num() > 0) ? CsvRows[0] : FString();
+	if (Existing[0].TrimStartAndEnd() != CurrentHeader.TrimStartAndEnd())
+	{
+		UE_LOG(LogRobotSim, Warning,
+			TEXT("[APickPlaceTaskActor] 누적 대상 '%s'의 헤더가 현재 헤더와 달라 이어붙이지 않고 새로 시작합니다 (컬럼 스키마 변경)."),
+			*FilePath);
+		return;
+	}
+
+	// 헤더(0행)를 뺀 나머지가 과거 데이터다.
+	AccumulatedPriorRows.Reserve(Existing.Num() - 1);
+	for (int32 i = 1; i < Existing.Num(); ++i)
+	{
+		AccumulatedPriorRows.Add(Existing[i]);
+	}
+
+	UE_LOG(LogRobotSim, Log,
+		TEXT("[APickPlaceTaskActor] 누적 모드 — 기존 %d행 뒤에 이번 사이클을 이어붙입니다: %s"),
+		AccumulatedPriorRows.Num(), *FilePath);
+}
+
 void APickPlaceTaskActor::WriteCsvToDisk()
 {
-	// 헤더 한 줄뿐이면 실제 샘플이 없다는 뜻이므로 빈 파일을 만들지 않는다.
+	// 헤더 한 줄뿐이면 이번 사이클 샘플이 없다는 뜻이므로 빈 파일을 만들지 않는다.
+	// (누적 모드에서 과거 행만 있고 새 샘플이 0인 경우도 다시 쓸 이유가 없다.)
 	if (!bEnableCsvLogging || CsvRows.Num() <= 1)
 	{
 		return;
 	}
 
-	// StartCycle이 확정한 이름을 쓴다. EndPlay가 StartCycle 없이 불릴 수도 있으므로 폴백을 둔다.
-	const FString FileName = ResolvedCsvFileName.IsEmpty() ? CsvFileName : ResolvedCsvFileName;
-	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("RobotSim"));
-	const FString FilePath = FPaths::Combine(Directory, FileName);
+	const FString FilePath = GetMotionCsvPath();
+	const FString Directory = FPaths::GetPath(FilePath);
 
 	// SaveStringArrayToFile은 디렉터리를 만들어 주지 않는다 — 첫 실행에서 조용히 실패하지 않도록 먼저 만든다.
 	IFileManager::Get().MakeDirectory(*Directory, /*Tree=*/true);
 
-	// UTF-8(BOM 포함) 강제. 기본값(AutoDetect)은 비ASCII 문자가 하나라도 있으면 **UTF-16**으로 쓰는데,
-	// 그러면 pandas/awk 같은 일반 도구가 못 읽어 제출물로 부적합해진다. phase 이름이 지금은 전부
-	// ASCII라 우연히 괜찮았을 뿐, 한글이 한 글자만 섞여도 조용히 UTF-16이 된다.
-	// (BOM이 있어야 Excel이 UTF-8로 인식한다 — 없으면 한글이 깨진다.)
-	if (FFileHelper::SaveStringArrayToFile(CsvRows, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8))
+	// 출력 = [헤더] + [과거 누적 행] + [이번 사이클 행]. 누적을 끄면 AccumulatedPriorRows가 비어
+	// 기존 동작(이번 사이클만 덮어쓰기)과 정확히 같다.
+	//
+	// **디스크 append가 아니라 전체 덮어쓰기**를 쓰는 이유: append는 ForceUTF8이 붙이는 BOM이 파일
+	// 중간에 박혀 파서를 깨뜨린다. 매번 전체를 쓰면 BOM은 항상 맨 앞 한 번뿐이고, 몇 번을 flush해도
+	// 파일이 처음부터 끝까지 온전하다 (덮어쓰기라 중복도 없다).
+	TArray<FString> Output;
+	Output.Reserve(1 + AccumulatedPriorRows.Num() + (CsvRows.Num() - 1));
+	Output.Add(CsvRows[0]); // 헤더
+	Output.Append(AccumulatedPriorRows);
+	for (int32 i = 1; i < CsvRows.Num(); ++i)
 	{
-		UE_LOG(LogRobotSim, Log, TEXT("[APickPlaceTaskActor] CSV %d행 기록: %s"), CsvRows.Num() - 1, *FilePath);
+		Output.Add(CsvRows[i]);
+	}
+
+	// UTF-8(BOM 포함) 강제 — 기본값(AutoDetect)은 비ASCII가 하나라도 있으면 UTF-16으로 써서
+	// pandas/awk가 못 읽는다. BOM이 있어야 Excel도 UTF-8로 인식한다.
+	if (FFileHelper::SaveStringArrayToFile(Output, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8))
+	{
+		UE_LOG(LogRobotSim, Log,
+			TEXT("[APickPlaceTaskActor] CSV %d행 기록%s: %s"),
+			Output.Num() - 1,
+			AccumulatedPriorRows.Num() > 0 ? TEXT(" (누적)") : TEXT(""), *FilePath);
 	}
 	else
 	{
 		UE_LOG(LogRobotSim, Warning, TEXT("[APickPlaceTaskActor] CSV 기록 실패: %s (경로/권한 확인)"), *FilePath);
 	}
 
-	// **버퍼를 비우지 않는다.** SaveStringArrayToFile은 append가 아니라 **덮어쓰기**이므로, 여기서
-	// 헤더만 남기면 다음 기록 때 파일이 "마지막 flush 이후의 행"으로 덮여 그 앞이 통째로 사라진다.
-	// (D-01의 Save CSV 버튼처럼 사이클 도중 flush하면 즉시 터진다. 사이클 하나가 120Hz×수십 초 =
-	//  수천 행이라 전량 보관해도 메모리는 무시할 만하다.)
-	// 매번 전체를 쓰므로 몇 번을 눌러도 파일은 항상 처음부터 끝까지 온전하다.
+	// CsvRows는 비우지 않는다 — 사이클 도중 여러 번 flush해도 매번 전체를 다시 쓰므로 온전하다.
 }
 
 const TCHAR* APickPlaceTaskActor::PhaseToString(EPickPlacePhase InPhase)
